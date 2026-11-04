@@ -30,3 +30,6 @@ data/
 .idea/
 .vscode/
 backend/static/
+
+# Celery beat local state (make dev-worker)
+celerybeat-schedule*
