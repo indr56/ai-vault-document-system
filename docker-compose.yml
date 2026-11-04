@@ -1,0 +1,97 @@
+# One command:  docker compose up --build   ->  UI + API on http://localhost:9700
+name: ai-vault
+
+x-app: &app
+  build: .
+  image: ai-vault-app:local
+  env_file:
+    - path: .env
+      required: false   # works without .env; AI features need OPENAI_API_KEY
+  environment:
+    DATABASE_URL: postgresql+asyncpg://vault:vault@db:5432/vault
+    SYNC_DATABASE_URL: postgresql+psycopg://vault:vault@db:5432/vault
+    REDIS_URL: redis://redis:6379/0
+    CELERY_BROKER_URL: redis://redis:6379/1
+    CELERY_RESULT_BACKEND: redis://redis:6379/2
+    STORAGE_DIR: /data/uploads
+  volumes:
+    - uploads:/data/uploads
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *app
+    command: ["api"]
+    ports:
+      - "${API_PORT:-9700}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  worker:
+    <<: *app
+    command: ["worker"]
+    depends_on:
+      api:
+        condition: service_healthy   # the API runs migrations first
+
+  # `make test` / `docker compose --profile test run --rm tests` (fake AI provider, no API key needed)
+  tests:
+    build:
+      context: .
+      target: test
+    image: ai-vault-tests:local
+    profiles: ["test"]
+    environment:
+      TEST_DB_HOST: db
+      TEST_DB_PORT: "5432"
+      TEST_REDIS_URL: redis://redis:6379
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: vault
+      POSTGRES_PASSWORD: vault
+      POSTGRES_DB: vault
+    ports:
+      - "${DB_PORT:-9701}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vault -d vault"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-9702}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
