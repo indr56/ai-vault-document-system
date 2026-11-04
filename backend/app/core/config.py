@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     min_relevance_score: float = 0.2  # below this cosine similarity, evidence is treated as weak
     chat_history_turns: int = 6
     answer_cache_ttl_seconds: int = 3600
+    # Meaning-based answer cache: reuse an answer when a new question's embedding is at least this
+    # similar to an already-answered one (same documents). Measured with text-embedding-3-small:
+    # paraphrases scored 0.88-0.92, different questions on the same topic 0.48-0.80.
+    semantic_cache_threshold: float = 0.88
+    semantic_cache_max_entries: int = 200
     embedding_cache_ttl_seconds: int = 7 * 24 * 3600
 
     # --- Limits & quotas (per API key) ---

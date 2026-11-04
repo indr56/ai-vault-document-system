@@ -107,7 +107,10 @@ class PreparedQuestion:
     chunks: list[RetrievedChunk] = field(default_factory=list)
     sources: list[chat_prompt.SourceChunk] = field(default_factory=list)
     cache_key: str = ""
+    semantic_index_key: str = ""
+    embedding: list[float] | None = None
     cached: dict[str, Any] | None = None
+    cache_match: dict[str, Any] | None = None  # how a cached answer was found (exact / similar question)
     retrieval_ms: int = 0
     usages: list[tuple[str, Usage, str | None]] = field(default_factory=list)  # (operation, usage, prompt_version)
 
@@ -161,12 +164,29 @@ async def prepare_question(
     prepared.cache_key = cache.answer_cache_key(
         str(user.id), versions, prepared.standalone_question, chat_prompt.VERSION
     )
-    prepared.cached = await cache.aget_json(prepared.cache_key) if use_cache else None
-    if prepared.cached is not None:
-        return prepared
+    prepared.semantic_index_key = cache.semantic_index_key(str(user.id), versions, chat_prompt.VERSION)
+    if use_cache:
+        prepared.cached = await cache.aget_json(prepared.cache_key)
+        if prepared.cached is not None:
+            prepared.cache_match = {"type": "exact", "question": prepared.standalone_question, "similarity": 1.0}
+            return prepared
 
     start = time.perf_counter()
     embedding = await _embed_query(prepared.standalone_question, prepared)
+    prepared.embedding = embedding
+    if use_cache:
+        match = await cache.afind_semantic(prepared.semantic_index_key, embedding)
+        if match is not None:
+            answer_key, matched_question, similarity = match
+            prepared.cached = await cache.aget_json(answer_key)
+            if prepared.cached is not None:
+                prepared.cache_match = {
+                    "type": "similar",
+                    "question": matched_question,
+                    "similarity": round(similarity, 3),
+                }
+                return prepared
+
     chunks = await hybrid_search(
         db,
         owner_id=user.id,
@@ -186,7 +206,12 @@ async def prepare_question(
 
 # --------------------------------------------------------------------------- post-processing
 def extract_citations(answer: str, prepared: PreparedQuestion) -> list[dict[str, Any]]:
-    """Map [n] markers in the answer back to the retrieved chunks (ignores invented numbers)."""
+    """Map [n] markers in the answer back to the retrieved chunks (ignores invented numbers).
+
+    A "not found" answer gets no citations: listing sources under it would look like evidence for
+    an answer that doesn't exist."""
+    if answer.strip().startswith(chat_prompt.ABSTAIN_PREFIX):
+        return []
     titles = {d.id: d.title for d in prepared.documents}
     used: list[int] = []
     for match in CITATION_RE.finditer(answer):
@@ -288,6 +313,7 @@ async def _save_exchange(
                 for c in prepared.chunks
             ],
             "retrieval_ms": prepared.retrieval_ms,
+            "cache_match": prepared.cache_match,
         },
         grounded=bool(citations) and not abstained,
         abstained=abstained,
@@ -326,6 +352,10 @@ async def _cache_answer(
         },
         get_settings().answer_cache_ttl_seconds,
     )
+    if prepared.embedding is not None:
+        await cache.aadd_semantic_entry(
+            prepared.semantic_index_key, prepared.standalone_question, prepared.embedding, prepared.cache_key
+        )
 
 
 def _restore_cached_chunks(prepared: PreparedQuestion) -> None:

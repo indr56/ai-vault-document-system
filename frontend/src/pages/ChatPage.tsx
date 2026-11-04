@@ -284,7 +284,16 @@ function AssistantMsg({ m }: { m: Message }) {
       </div>
       <div className="row small muted" style={{ marginTop: 4 }}>
         {m.abstained ? <span className="badge warn">Not found in documents</span> : m.grounded ? <span className="badge ok">Grounded</span> : null}
-        {m.from_cache && <span className="badge plain">Cached</span>}
+        {m.from_cache && (
+          <span
+            className="badge plain"
+            title={m.cache_match ? `Reused the answer to: “${m.cache_match.question}”` : "Reused an earlier answer"}
+          >
+            {m.cache_match?.type === "similar"
+              ? `Cached · similar question (${Math.round(m.cache_match.similarity * 100)}% match)`
+              : "Cached"}
+          </span>
+        )}
         {m.latency_ms != null && <span>{(m.latency_ms / 1000).toFixed(1)} s</span>}
         {m.standalone_question && m.standalone_question !== "" && (
           <span title="How the follow-up was interpreted for search">↳ searched: “{m.standalone_question}”</span>
@@ -301,7 +310,7 @@ function SourceCard({ c, active, onClick }: { c: Citation; active: boolean; onCl
         <strong>
           [{c.number}] {c.document_title}
         </strong>
-        <span className="muted small">{c.page_number ? `page ${c.page_number}` : "no page numbers"}</span>
+        <span className="muted small">{c.page_number ? `page ${c.page_number}` : "no pages in this file type"}</span>
       </div>
       {active && <div className="muted" style={{ marginTop: 4 }}>{c.snippet}</div>}
     </div>

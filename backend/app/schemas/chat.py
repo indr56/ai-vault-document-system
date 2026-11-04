@@ -60,6 +60,10 @@ class MessageOut(BaseModel):
     abstained: bool | None = None
     standalone_question: str | None = None
     from_cache: bool = False
+    cache_match: dict[str, Any] | None = Field(
+        default=None,
+        description="For cached answers: the earlier question it matched (exact or similar) and how closely",
+    )
     latency_ms: int | None = None
     created_at: datetime
 

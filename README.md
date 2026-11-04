@@ -53,7 +53,7 @@ There's no `make`? Use `cp .env.example .env` then `docker compose up --build -d
 
 ```bash
 make smoke   # end-to-end: upload → process → insights → versioning → chat → streaming → summary → compare → metrics
-make test    # 36 tests in Docker with a fake AI provider (no API key or cost)
+make test    # 38 tests in Docker with a fake AI provider (no API key or cost)
 make eval    # RAG quality evaluation (19 questions) against the running stack
 make help    # all commands
 ```
@@ -95,14 +95,14 @@ All required components plus every bonus item. Each one works end to end and is 
 | | **Citations** `[n]` mapped to document, page and snippet; **abstains** when the answer isn't in the documents | `llm/prompts/chat.py` |
 | | **Streaming** answers (SSE) and **follow-up suggestions** | `/messages/stream` |
 | **Advanced AI** | **Document comparison** (2–5 docs, e.g. policy v1 vs v2): structured differences with values, pages and impact | `services/comparison.py` |
-| **Product** | **Versioning** (upload a new version; history; delete promotes the previous one) | `POST /documents` + `replaces_document_id` |
+| **Product** | **Versioning** (upload a new version; history; open any older version; delete promotes the previous one) | `POST /documents` + `replaces_document_id` |
 | | **Duplicate detection** (same content returns the existing document, so nobody pays twice) | `services/documents.py` |
 | | **Batch upload** with per-file errors | `POST /documents/batch` |
 | | **Real-time status** over WebSocket (Redis pub/sub) | `/api/v1/events` |
 | | Simple **web UI** (React + TypeScript): documents, insights, chat with clickable citations, compare, monitoring | `frontend/` |
 | **Production** | **Cost tracking**: every model call stored with tokens, latency, USD | `services/usage.py` |
 | | **Rate limiting** per API key + **daily token quota** | `core/rate_limit.py` |
-| | **Caching**: embeddings (Redis), answers (Redis, invalidated by document version), summaries (DB) | `services/cache.py` |
+| | **Caching**: embeddings (Redis); answers (Redis, invalidated by document version), matched **by meaning**, so paraphrased questions reuse an answer; summaries (DB) | `services/cache.py` |
 | | **Metrics APIs**: documents, processing (p50/p95, per stage, errors), AI usage and cost, chat quality, API latency per route, system health and queue depth | `services/metrics.py` |
 | | Health and readiness probes; structured JSON logs with request IDs | `api/health.py`, `main.py` |
 | | API-key auth with per-owner data isolation | `core/security.py` |
@@ -256,8 +256,9 @@ Schema is managed by **Alembic** (`backend/alembic/versions/`), applied automati
 
 ```
 question ──► (follow-up?) rewrite to standalone question   [fast model, uses last 6 turns]
-         ──► answer cache?  (owner + document versions + question + prompt version)
+         ──► answer cache, exact?  (owner + document versions + question + prompt version)
          ──► embed question (Redis-cached)
+         ──► answer cache, by meaning?  (cosine ≥ 0.88 with an answered question on the same documents)
          ──► hybrid search over the session's ready documents only
                • vector: pgvector cosine (HNSW), top 24
                • keyword: Postgres websearch_to_tsquery + ts_rank_cd, top 24
@@ -377,7 +378,7 @@ Next steps at larger scale (roughly 100k+ documents or many concurrent users):
 
 | Command | What | Cost |
 |---|---|---|
-| `make test` | 36 tests:<br/>• Units: parsing (incl. edge-case files), validation, chunking, RRF fusion, citation mapping, cost<br/>• API integration on real Postgres + Redis: upload, duplicates, validation, failures, batch, versioning, summaries, reprocess, chat with citations, abstention, multi-turn, cache, SSE, comparison, metrics, rate limits | Free (fake AI) |
+| `make test` | 38 tests:<br/>• Units: parsing (incl. edge-case files), validation, chunking, RRF fusion, citation mapping, cost<br/>• API integration on real Postgres + Redis: upload, duplicates, validation, failures, batch, versioning, summaries, reprocess, chat with citations, abstention, multi-turn, cache, SSE, comparison, metrics, rate limits | Free (fake AI) |
 | `make lint` | ruff + mypy (strict-ish), all passing | — |
 | `make smoke` | The full user journey against the real stack and model, with readable output | ≈ $0.03 |
 | `make eval` | 19 labelled questions over the samples:<br/>• answer accuracy<br/>• citation document and page accuracy<br/>• abstention accuracy (incl. off-topic and prompt injection)<br/>• arithmetic over cited figures<br/>• false-abstention rate<br/>• latency and cost | ≈ $0.03 |

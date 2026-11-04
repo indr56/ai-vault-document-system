@@ -31,7 +31,7 @@ AI wrote most of the code. My job was to set direction and to verify.
    - nothing touched outside the project folder
 4. **Build in vertical slices, verify each one against a real running stack** (Postgres, Redis, worker, real OpenAI calls), not only unit tests.
 5. **Verification gates:**
-   - `make test`: 36 tests with a fake provider
+   - `make test`: 38 tests with a fake provider
    - `make lint`: ruff + mypy
    - `make smoke`: the full journey with the real model
    - `make eval`: 19 labelled questions
@@ -55,6 +55,10 @@ These are the issues that came up during the build. Most were caught by running 
 | 9 | `send_task()` ignores Celery's eager mode, so tests would have needed a live worker | Planning the test strategy | Switched to `task.delay()` so tests run the pipeline inline |
 | 10 | **The chat model presented a computed number as a quote and explained it wrongly.** Asked to compare the GL quote ($18,400 + $250 fee) with the broker's cyber fee ($15,000), it said the GL quote is *"$3,650"* more (in quotation marks, as if the document said it) *"before considering … the $250 policy fee"*. But $3,650 already includes the fee, so the explanation contradicted the number | Reading the answers while taking the README screenshots; the eval had no calculation question, so it couldn't catch this | Added prompt rule 7 (`chat-v5`): calculate only when needed, show the working with the cited inputs (now: "$18,400 + $250 − $15,000 = $3,650 [2][1]"), never quote computed values. Added an arithmetic case to the eval |
 | 11 | The eval comment claimed a new session bypasses the answer cache. It doesn't: the cache is keyed on documents + question, not session | Reviewing the eval code | Added an explicit `use_cache=false` request option for evaluations |
+| 12 | **The same question asked a third time wasn't cached.** The cache key used the *rewritten* question, and with more history the rewrite model phrased it slightly differently ("…for the insurance policy?") | Found by Indranil while testing the UI | Added a meaning-based cache: each answered question's embedding is stored, and a new question with cosine similarity ≥ 0.88 (same documents) reuses the answer. The threshold was set by measurement: paraphrases scored 0.88–0.92, different questions on the same topic 0.48–0.80. The badge shows which earlier question was matched |
+| 13 | **"Not found" answers listed every document as a source** (the CEO question cited all 3), which looked like evidence for an answer that doesn't exist | Found by Indranil while testing the UI | Not-found answers carry no citations (code + prompt rule 4, `chat-v6`) |
+| 14 | **Comparison embedded the same focus question once per document, and those embedding calls weren't recorded in cost tracking** | Counting calls per operation against the OpenAI usage dashboard | Embed once per comparison (Redis-cached) and record it as `embed_query` |
+| 15 | Upload messages never disappeared; files dropped outside the small drop box were opened by the browser instead of uploaded | Found by Indranil while testing the UI | Messages fade after 6 s (errors 15 s) with a ✕; files can be dropped anywhere on the Documents page |
 
 ### How output was verified
 
@@ -95,7 +99,7 @@ Structured outputs (`chat.completions.parse` with Pydantic models in `llm/schema
 
 ### The chat prompt
 
-File: `backend/app/llm/prompts/chat.py` (version `chat-v5`). This is the most important prompt in the system.
+File: `backend/app/llm/prompts/chat.py` (version `chat-v6`). This is the most important prompt in the system.
 
 ```text
 You are Vault Assistant. You answer questions about the user's documents using ONLY the numbered
@@ -108,7 +112,7 @@ How to answer:
 3. Quote figures, dates, names and amounts exactly as written in the sources.
 4. If the sources do not contain the answer, start your reply with exactly:
    "I couldn't find this in the selected documents." Then, in one sentence, say what related
-   information the sources do contain (with citations), if any.
+   information the sources do contain, if any. Do not cite sources in a "not found" answer.
 5. If the sources only partially answer, answer the supported part with citations and clearly state
    what is missing.
 6. If sources conflict (e.g. two versions of a policy), say so and cite each side.

@@ -107,6 +107,15 @@ class TestCitations:
         assert len(citations) == 1
         assert citations[0]["page_number"] == 7 and citations[0]["document_title"] == "Policy"
 
+    def test_not_found_answer_has_no_citations(self) -> None:
+        doc_id = uuid.uuid4()
+        prepared = PreparedQuestion(
+            question="q", standalone_question="q", documents=[SimpleNamespace(id=doc_id, title="Policy")], history=[]
+        )
+        prepared.chunks = [RetrievedChunk(uuid.uuid4(), doc_id, 0, 1, "text", 0.5, 0.1)]
+        answer = "I couldn't find this in the selected documents. They mention Acme [1]."
+        assert extract_citations(answer, prepared) == []
+
 
 class TestCost:
     def test_cost_uses_base_model_price_for_dated_ids(self) -> None:

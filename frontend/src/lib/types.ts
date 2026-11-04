@@ -84,6 +84,7 @@ export interface Message {
   abstained: boolean | null;
   standalone_question: string | null;
   from_cache: boolean;
+  cache_match?: { type: "exact" | "similar"; question: string; similarity: number } | null;
   latency_ms: number | null;
   created_at: string;
 }

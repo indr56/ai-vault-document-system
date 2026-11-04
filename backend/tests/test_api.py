@@ -148,6 +148,20 @@ async def test_chat_multi_turn_cache_and_history(client: httpx.AsyncClient, read
     assert [m["role"] for m in history["messages"]] == ["user", "assistant", "user", "assistant"]
 
 
+async def test_chat_semantic_cache_reuses_answer_for_similar_question(
+    client: httpx.AsyncClient, ready_docs: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.config import get_settings
+
+    # The fake provider's hashed word embeddings are cruder than OpenAI's, so use a looser threshold here.
+    monkeypatch.setattr(get_settings(), "semantic_cache_threshold", 0.8)
+    first = await _ask(client, await _session(client, [ready_docs["policy"]]), "What is the flood deductible amount?")
+    second = await _ask(client, await _session(client, [ready_docs["policy"]]), "flood deductible amount")
+    assert first["from_cache"] is False
+    assert second["from_cache"] is True and second["cache_match"]["type"] == "similar"
+    assert second["content"] == first["content"]
+
+
 async def test_chat_streaming_sse(client: httpx.AsyncClient, ready_docs: dict[str, str]) -> None:
     session_id = await _session(client, [ready_docs["quote"]])
     events: list[tuple[str, dict]] = []

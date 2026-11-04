@@ -18,22 +18,35 @@ from app.llm.schemas import ComparisonOutput
 from app.models import Comparison, Document, DocumentInsight
 from app.models.enums import ComparisonStatus
 from app.services import events
+from app.services.cache import get_cached_embeddings, set_cached_embeddings
 from app.services.retrieval import hybrid_search_sync
 from app.services.usage import record_usage
 
 logger = get_logger(__name__)
 
+# Used when the user gives no focus: generic and document-type neutral. "or" makes the keyword
+# side of hybrid search match any of the terms (websearch syntax), not all of them.
 DEFAULT_FOCUS_QUERY = (
-    "key terms coverage limits amounts prices premiums deductibles dates conditions exclusions obligations"
+    "key terms or amounts or prices or limits or dates or deadlines or parties or obligations or conditions"
 )
 CHUNKS_PER_DOCUMENT = 8
 LABELS = "ABCDEFGHIJ"
 
 
-def _evidence_pack(db: Session, label: str, document: Document, focus: str) -> str:
+def _embed_focus(db: Session, comparison: Comparison) -> tuple[str, list[float]]:
+    """Embed the focus once per comparison (cached across comparisons) and record its cost."""
     provider = get_provider()
-    query = focus or DEFAULT_FOCUS_QUERY
-    embedding = provider.embed([query]).vectors[0]
+    query = comparison.focus or DEFAULT_FOCUS_QUERY
+    cached = get_cached_embeddings(provider.embedding_model, [query])[0]
+    if cached is not None:
+        return query, cached
+    result = provider.embed([query])
+    set_cached_embeddings(provider.embedding_model, {query: result.vectors[0]})
+    record_usage(db, result.usage, operation="embed_query", owner_id=comparison.owner_id)
+    return query, result.vectors[0]
+
+
+def _evidence_pack(db: Session, label: str, document: Document, query: str, embedding: list[float]) -> str:
     chunks = hybrid_search_sync(
         db,
         owner_id=document.owner_id,
@@ -68,8 +81,9 @@ def run_comparison_job(comparison_id: uuid.UUID) -> str:
             documents = [db.get(Document, uuid.UUID(d)) for d in comparison.document_ids]
             if any(d is None for d in documents):
                 raise ValueError("One of the documents no longer exists.")
+            query, embedding = _embed_focus(db, comparison)
             material = "\n\n".join(
-                _evidence_pack(db, LABELS[i], doc, comparison.focus)  # type: ignore[arg-type]
+                _evidence_pack(db, LABELS[i], doc, query, embedding)  # type: ignore[arg-type]
                 for i, doc in enumerate(documents)
             )
             provider = get_provider()

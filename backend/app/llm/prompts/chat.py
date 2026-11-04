@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from app.llm.base import Message
 
-VERSION = "chat-v5"
+VERSION = "chat-v6"
 
 ABSTAIN_PREFIX = "I couldn't find this in the selected documents."
 
@@ -25,7 +25,8 @@ How to answer:
 $25,000 [2]." Use only source numbers that exist. Cite multiple sources like [1][3].
 3. Quote figures, dates, names and amounts exactly as written in the sources.
 4. If the sources do not contain the answer, start your reply with exactly: "{ABSTAIN_PREFIX}" \
-Then, in one sentence, say what related information the sources do contain (with citations), if any.
+Then, in one sentence, say what related information the sources do contain, if any. Do not cite \
+sources in a "not found" answer.
 5. If the sources only partially answer, answer the supported part with citations and clearly state \
 what is missing.
 6. If sources conflict (e.g. two versions of a policy), say so and cite each side.

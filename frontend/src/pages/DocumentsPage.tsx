@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+
+type Note = { id: number; kind: "info" | "error"; text: string };
+let noteSeq = 0;
 import { Empty, ErrorNote, InsightsBadge, StatusBadge } from "../components/ui";
 import { api, formatBytes, post, timeAgo } from "../lib/api";
 import type { DocumentItem, Insights, ProcessingRun, SummaryResult, UploadResult, VaultEvent } from "../lib/types";
@@ -12,10 +15,19 @@ interface Props {
 
 export default function DocumentsPage({ documents, refresh, onChat, lastEvent }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [notes, setNotes] = useState<{ kind: "info" | "error"; text: string }[]>([]);
+  const [notes, setNotes] = useState<Note[]>([]);
+  const [extraDoc, setExtraDoc] = useState<DocumentItem | null>(null); // an older version opened from Versions
+  const dismiss = (id: number) => setNotes((n) => n.filter((x) => x.id !== id));
+  const pushNotes = (items: Omit<Note, "id">[]) => {
+    const withIds = items.map((n) => ({ ...n, id: ++noteSeq }));
+    setNotes((n) => [...n, ...withIds]);
+    // Info messages fade after 6 s, errors after 15 s; both can be closed with ✕.
+    withIds.forEach((n) => window.setTimeout(() => dismiss(n.id), n.kind === "info" ? 6000 : 15000));
+  };
   const [filter, setFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [dragging, setDragging] = useState(false);
 
   const visible = useMemo(
     () =>
@@ -26,12 +38,13 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
       ),
     [documents, filter, statusFilter],
   );
-  const selected = documents.find((d) => d.id === selectedId) ?? null;
+  const selected =
+    documents.find((d) => d.id === selectedId) ?? (extraDoc && extraDoc.id === selectedId ? extraDoc : null);
 
   const upload = async (files: File[], replaces?: string) => {
     if (!files.length) return;
     setUploading(true);
-    const next: typeof notes = [];
+    const next: Omit<Note, "id">[] = [];
     try {
       if (files.length === 1 || replaces) {
         const form = new FormData();
@@ -54,13 +67,47 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
       next.push({ kind: "error", text: e instanceof Error ? e.message : String(e) });
     } finally {
       setUploading(false);
-      setNotes(next);
+      pushNotes(next);
       await refresh();
     }
   };
 
+  // Files can be dropped anywhere on the page, not only on the drop box.
+  const uploadRef = useRef(upload);
+  uploadRef.current = upload;
+  useEffect(() => {
+    let depth = 0;
+    const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes("Files");
+    const onEnter = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      depth += 1;
+      setDragging(true);
+    };
+    const onLeave = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setDragging(false);
+    };
+    const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      depth = 0;
+      setDragging(false);
+      void uploadRef.current(Array.from(e.dataTransfer?.files ?? []));
+    };
+    window.addEventListener("dragenter", onEnter);
+    window.addEventListener("dragleave", onLeave);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onEnter);
+      window.removeEventListener("dragleave", onLeave);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, []);
+
   return (
     <div className="page">
+      {dragging && <div className="drop-overlay">Drop files to upload</div>}
       <div className="page-head">
         <div>
           <h1>Documents</h1>
@@ -79,9 +126,12 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
       </div>
 
       <DropZone onFiles={(f) => upload(f)} busy={uploading} />
-      {notes.map((n, i) => (
-        <div key={i} className={`alert ${n.kind === "info" ? "info" : ""}`}>
-          {n.text}
+      {notes.map((n) => (
+        <div key={n.id} className={`alert note ${n.kind === "info" ? "info" : ""}`}>
+          <span>{n.text}</span>
+          <button className="note-close" onClick={() => dismiss(n.id)} aria-label="Dismiss">
+            ✕
+          </button>
         </div>
       ))}
 
@@ -124,7 +174,7 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
                         {d.status === "failed"
                           ? d.error?.message
                           : d.status === "ready"
-                            ? `${d.page_count ? `${d.page_count} pages · ` : ""}${d.chunk_count} chunks · ${((d.processing_ms ?? 0) / 1000).toFixed(1)}s`
+                            ? `${d.page_count ? `${d.page_count} pages · ` : ""}${d.chunk_count} chunk${d.chunk_count === 1 ? "" : "s"} · ${((d.processing_ms ?? 0) / 1000).toFixed(1)}s`
                             : ""}
                       </td>
                     )}
@@ -143,6 +193,10 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
             onClose={() => setSelectedId(null)}
             onChat={() => onChat([selected.id])}
             onNewVersion={(f) => upload([f], selected.id)}
+            onOpenVersion={(v) => {
+              setExtraDoc(v);
+              setSelectedId(v.id);
+            }}
             onDeleted={async () => {
               setSelectedId(null);
               await refresh();
@@ -167,11 +221,7 @@ function DropZone({ onFiles, busy }: { onFiles: (files: File[]) => void; busy: b
         setOver(true);
       }}
       onDragLeave={() => setOver(false)}
-      onDrop={(e) => {
-        e.preventDefault();
-        setOver(false);
-        onFiles(Array.from(e.dataTransfer.files));
-      }}
+      onDrop={() => setOver(false)} // the page-level handler uploads the files
     >
       <input
         ref={input}
@@ -205,6 +255,7 @@ function DocumentDetail({
   onClose,
   onChat,
   onNewVersion,
+  onOpenVersion,
   onDeleted,
   refresh,
 }: {
@@ -213,6 +264,7 @@ function DocumentDetail({
   onClose: () => void;
   onChat: () => void;
   onNewVersion: (file: File) => void;
+  onOpenVersion: (doc: DocumentItem) => void;
   onDeleted: () => Promise<void>;
   refresh: () => Promise<void>;
 }) {
@@ -248,6 +300,9 @@ function DocumentDetail({
           <StatusBadge doc={doc} />
           {doc.status === "ready" && <InsightsBadge status={doc.insights_status} stage={doc.stage} />}
         </div>
+        {!doc.is_latest && (
+          <div className="alert info">You are viewing an older version (v{doc.version}). Chat and Compare can still use it.</div>
+        )}
         {doc.error && (
           <div className="alert">
             <strong>{doc.error.code}</strong> — {doc.error.message}
@@ -302,7 +357,7 @@ function DocumentDetail({
       <div className="card-pad">
         {tab === "insights" && <InsightsTab doc={doc} lastEvent={lastEvent} />}
         {tab === "summary" && <SummaryTab doc={doc} />}
-        {tab === "versions" && <VersionsTab doc={doc} />}
+        {tab === "versions" && <VersionsTab doc={doc} onOpen={onOpenVersion} />}
         {tab === "processing" && <ProcessingTab doc={doc} lastEvent={lastEvent} />}
       </div>
     </div>
@@ -458,7 +513,7 @@ function SummaryTab({ doc }: { doc: DocumentItem }) {
   );
 }
 
-function VersionsTab({ doc }: { doc: DocumentItem }) {
+function VersionsTab({ doc, onOpen }: { doc: DocumentItem; onOpen: (v: DocumentItem) => void }) {
   const [versions, setVersions] = useState<DocumentItem[] | null>(null);
   useEffect(() => {
     api<DocumentItem[]>(`/documents/${doc.id}/versions`).then(setVersions, () => setVersions([]));
@@ -468,7 +523,12 @@ function VersionsTab({ doc }: { doc: DocumentItem }) {
     <table className="table">
       <tbody>
         {versions.map((v) => (
-          <tr key={v.id}>
+          <tr
+            key={v.id}
+            className={`clickable ${v.id === doc.id ? "selected" : ""}`}
+            onClick={() => v.id !== doc.id && onOpen(v)}
+            title={v.id === doc.id ? "Currently open" : "Open this version"}
+          >
             <td>
               <strong>v{v.version}</strong> {v.is_latest && <span className="badge ok">latest</span>}
             </td>

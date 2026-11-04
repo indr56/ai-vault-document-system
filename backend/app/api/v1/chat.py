@@ -44,7 +44,9 @@ def _session_out(session: ChatSession, message_count: int) -> SessionOut:
 
 
 def _message_out(message: ChatMessage) -> MessageOut:
-    return MessageOut.model_validate(message)
+    out = MessageOut.model_validate(message)
+    out.cache_match = (message.retrieval or {}).get("cache_match")
+    return out
 
 
 @router.post(
