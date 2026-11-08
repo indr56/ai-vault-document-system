@@ -24,10 +24,15 @@ def hash_api_key(raw_key: str) -> str:
 
 
 def generate_api_key() -> str:
+    """Used by POST /api-keys. 32 random bytes; the "vault_" prefix makes leaked keys easy to scan for."""
     return f"vault_{secrets.token_urlsafe(32)}"
 
 
 async def authenticate(db: AsyncSession, raw_key: str | None) -> User:
+    return (await authenticate_key(db, raw_key)).user
+
+
+async def authenticate_key(db: AsyncSession, raw_key: str | None) -> ApiKey:
     if not raw_key:
         raise UnauthorizedError("Missing API key. Send it in the X-API-Key header.")
     api_key = (
@@ -39,11 +44,12 @@ async def authenticate(db: AsyncSession, raw_key: str | None) -> User:
     ).scalar_one_or_none()
     if api_key is None:
         raise UnauthorizedError("Invalid API key.")
-    # Throttle last_used_at writes to once a minute.
+    # Shown in GET /api-keys so a user can spot unused keys before revoking them.
+    # Throttled to one write a minute so authentication doesn't write on every request.
     if api_key.last_used_at is None or utcnow() - api_key.last_used_at > timedelta(minutes=1):
         api_key.last_used_at = utcnow()
         await db.commit()
-    return api_key.user
+    return api_key
 
 
 async def get_current_user(
@@ -51,9 +57,10 @@ async def get_current_user(
     raw_key: str | None = Depends(api_key_header),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    user = await authenticate(db, raw_key)
-    request.state.user_id = user.id
-    return user
+    api_key = await authenticate_key(db, raw_key)
+    request.state.user_id = api_key.user_id
+    request.state.api_key_id = api_key.id  # lets DELETE /api-keys refuse to revoke the key in use
+    return api_key.user
 
 
 async def ensure_demo_user(db: AsyncSession) -> None:

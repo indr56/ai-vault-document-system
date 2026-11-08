@@ -92,7 +92,10 @@ class RequestMetric(UUIDPrimaryKey, Base):
     owner_id: Mapped[uuid.UUID | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    __table_args__ = (Index("ix_request_metrics_created", "created_at"),)
+    __table_args__ = (
+        Index("ix_request_metrics_created", "created_at"),
+        Index("ix_request_metrics_owner_created", "owner_id", "created_at"),  # GET /metrics/api is per user
+    )
 
 
 class Comparison(UUIDPrimaryKey, Timestamps, Base):

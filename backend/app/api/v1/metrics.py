@@ -25,9 +25,9 @@ async def ai_usage(db: DB, user: CurrentUser, days: Days = 7) -> dict[str, Any]:
     return await service.ai_usage_metrics(db, user.id, days)
 
 
-@router.get("/api", summary="API performance per route (requests, p50/p95 latency, error rates)")
+@router.get("/api", summary="API performance per route for your requests (requests, p50/p95 latency, error rates)")
 async def api_performance(db: DB, user: CurrentUser, hours: Annotated[int, Query(ge=1, le=168)] = 24) -> dict[str, Any]:
-    return await service.api_metrics(db, hours)
+    return await service.api_metrics(db, user.id, hours)
 
 
 @router.get("/system", summary="Database, Redis and worker health; queue depth")

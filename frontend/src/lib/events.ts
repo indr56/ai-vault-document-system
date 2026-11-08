@@ -14,8 +14,20 @@ export function useVaultEvents(onEvent: (event: VaultEvent) => void): boolean {
     let timer: number | undefined;
     let closed = false;
 
-    const connect = () => {
-      socket = new WebSocket(eventsUrl());
+    const scheduleReconnect = () => {
+      if (closed) return;
+      timer = window.setTimeout(connect, Math.min(1000 * 2 ** retry++, 15000));
+    };
+
+    const connect = async () => {
+      let url: string;
+      try {
+        url = await eventsUrl(); // fresh single-use ticket for every (re)connect
+      } catch {
+        return scheduleReconnect(); // API down or key invalid: try again later
+      }
+      if (closed) return;
+      socket = new WebSocket(url);
       socket.onopen = () => {
         retry = 0;
         setConnected(true);
@@ -29,11 +41,10 @@ export function useVaultEvents(onEvent: (event: VaultEvent) => void): boolean {
       };
       socket.onclose = () => {
         setConnected(false);
-        if (closed) return;
-        timer = window.setTimeout(connect, Math.min(1000 * 2 ** retry++, 15000));
+        scheduleReconnect();
       };
     };
-    connect();
+    void connect();
     return () => {
       closed = true;
       window.clearTimeout(timer);

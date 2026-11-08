@@ -278,7 +278,9 @@ async def ai_usage_metrics(db: AsyncSession, owner_id: uuid.UUID, days: int) -> 
     }
 
 
-async def api_metrics(db: AsyncSession, hours: int) -> dict[str, Any]:
+async def api_metrics(db: AsyncSession, owner_id: uuid.UUID, hours: int) -> dict[str, Any]:
+    """The caller's own requests only (like every other per-user view). System-wide health is
+    /metrics/system, which reveals no per-user data."""
     since = datetime.now(UTC) - timedelta(hours=hours)
     rows = (
         await db.execute(
@@ -292,7 +294,7 @@ async def api_metrics(db: AsyncSession, hours: int) -> dict[str, Any]:
                 func.sum(cast(RequestMetric.status_code >= 500, Integer)),
                 func.sum(cast(RequestMetric.status_code.between(400, 499), Integer)),
             )
-            .where(RequestMetric.created_at >= since)
+            .where(RequestMetric.owner_id == owner_id, RequestMetric.created_at >= since)
             .group_by(RequestMetric.method, RequestMetric.route)
             .order_by(func.count().desc())
         )

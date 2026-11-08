@@ -84,9 +84,11 @@ export async function postStream(
   }
 }
 
-export function eventsUrl(): string {
+/** WebSocket URL with a single-use ticket: the API key itself never goes into a URL (logs). */
+export async function eventsUrl(): Promise<string> {
+  const { ticket } = await post<{ ticket: string }>("/events/ticket");
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${location.host}${API}/events?api_key=${encodeURIComponent(getApiKey())}`;
+  return `${proto}://${location.host}${API}/events?ticket=${encodeURIComponent(ticket)}`;
 }
 
 export function formatBytes(bytes: number): string {
