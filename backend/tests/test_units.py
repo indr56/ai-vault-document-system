@@ -82,17 +82,24 @@ class TestChunking:
 
 
 class TestRetrievalFusion:
-    def _row(self, cid: uuid.UUID, similarity: float = 0.5) -> SimpleNamespace:
+    def _row(self, cid: uuid.UUID, similarity: float = 0.5, all_words: bool = True) -> SimpleNamespace:
         return SimpleNamespace(
-            id=cid, document_id=uuid.uuid4(), chunk_index=0, page_number=1, content="x", similarity=similarity
+            id=cid,
+            document_id=uuid.uuid4(),
+            chunk_index=0,
+            page_number=1,
+            content="x",
+            similarity=similarity,
+            all_words=all_words,
         )
 
     def test_rrf_rewards_chunks_found_by_both_searches(self) -> None:
         a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-        fused = _fuse([self._row(a), self._row(b)], [self._row(b), self._row(c)], top_k=3)
+        fused = _fuse([self._row(a), self._row(b)], [self._row(b), self._row(c, all_words=False)], top_k=3)
         assert fused[0].chunk_id == b
-        assert fused[0].keyword_match is True
+        assert fused[0].keyword_match is True  # contains every word of the question
         assert {f.chunk_id for f in fused} == {a, b, c}
+        assert next(f for f in fused if f.chunk_id == c).keyword_match is False  # only some words
 
 
 class TestCitations:

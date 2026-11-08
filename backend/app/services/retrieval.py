@@ -10,7 +10,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import Text, cast, func, select, text
+from sqlalchemy.dialects.postgresql import TSQUERY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
@@ -29,7 +30,7 @@ class RetrievedChunk:
     content: str
     similarity: float  # cosine similarity from the vector search (0 if only keyword-matched)
     score: float  # fused RRF score used for ranking
-    keyword_match: bool = False  # also matched the full-text (keyword) search
+    keyword_match: bool = False  # contains EVERY word of the question (strict full-text match)
 
 
 def _fuse(vector_rows: Sequence[Any], keyword_rows: Sequence[Any], top_k: int) -> list[RetrievedChunk]:
@@ -45,7 +46,7 @@ def _fuse(vector_rows: Sequence[Any], keyword_rows: Sequence[Any], top_k: int) -
         chunk = by_id.setdefault(
             row.id, RetrievedChunk(row.id, row.document_id, row.chunk_index, row.page_number, row.content, 0.0, 0.0)
         )
-        chunk.keyword_match = True
+        chunk.keyword_match = bool(row.all_words)
     ranked = sorted(scores, key=lambda cid: scores[cid], reverse=True)[:top_k]
     results = []
     for cid in ranked:
@@ -72,9 +73,22 @@ def _vector_query(owner_id: uuid.UUID, document_ids: list[uuid.UUID], embedding:
     )
 
 
+def _any_words_tsquery(query: str):  # type: ignore[no-untyped-def]
+    """'What happens if a pipe bursts?' -> 'happen' | 'pipe' | 'burst'.
+
+    plainto_tsquery drops filler words and reduces the rest to roots joined with AND (&);
+    swapping & for | means a chunk needs only ONE of the words to be a candidate. ts_rank_cd
+    still ranks chunks with more (and closer) words higher. The lexemes are already normalised,
+    so the text is cast straight back to tsquery without re-parsing.
+    """
+    strict_text = cast(func.plainto_tsquery("english", query), Text)
+    return cast(func.replace(strict_text, " & ", " | "), TSQUERY)
+
+
 def _keyword_query(owner_id: uuid.UUID, document_ids: list[uuid.UUID], query: str, limit: int):  # type: ignore[no-untyped-def]
-    tsquery = func.websearch_to_tsquery("english", query)
-    rank = func.ts_rank_cd(DocumentChunk.tsv, tsquery)
+    any_words = _any_words_tsquery(query)  # finds candidates and ranks them
+    all_words = func.websearch_to_tsquery("english", query)  # strict: used only for keyword_match
+    rank = func.ts_rank_cd(DocumentChunk.tsv, any_words)
     return (
         select(
             DocumentChunk.id,
@@ -83,11 +97,12 @@ def _keyword_query(owner_id: uuid.UUID, document_ids: list[uuid.UUID], query: st
             DocumentChunk.page_number,
             DocumentChunk.content,
             rank.label("rank"),
+            DocumentChunk.tsv.op("@@")(all_words).label("all_words"),
         )
         .where(
             DocumentChunk.owner_id == owner_id,
             DocumentChunk.document_id.in_(document_ids),
-            DocumentChunk.tsv.op("@@")(tsquery),
+            DocumentChunk.tsv.op("@@")(any_words),
         )
         .order_by(rank.desc())
         .limit(limit)

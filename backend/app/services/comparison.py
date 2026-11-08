@@ -24,11 +24,9 @@ from app.services.usage import record_usage
 
 logger = get_logger(__name__)
 
-# Used when the user gives no focus: generic and document-type neutral. "or" makes the keyword
-# side of hybrid search match any of the terms (websearch syntax), not all of them.
-DEFAULT_FOCUS_QUERY = (
-    "key terms or amounts or prices or limits or dates or deadlines or parties or obligations or conditions"
-)
+# Used when the user gives no focus: generic and document-type neutral. The keyword side of hybrid
+# search matches chunks containing ANY of these words (see retrieval._any_words_tsquery).
+DEFAULT_FOCUS_QUERY = "key terms, amounts, prices, limits, dates, deadlines, parties, obligations, conditions"
 CHUNKS_PER_DOCUMENT = 8
 LABELS = "ABCDEFGHIJ"
 

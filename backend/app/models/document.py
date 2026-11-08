@@ -14,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -49,6 +50,10 @@ class Document(UUIDPrimaryKey, Timestamps, Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     insights_status: Mapped[str] = mapped_column(String(20), default=InsightsStatus.PENDING, nullable=False)
+    # Non-fatal problems found while processing, shown on the document: [{"code": ..., "message": ...}]
+    warnings: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
 
     page_count: Mapped[int | None] = mapped_column(Integer)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

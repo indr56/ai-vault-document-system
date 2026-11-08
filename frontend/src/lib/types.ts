@@ -12,6 +12,7 @@ export interface DocumentItem {
   stage: string | null;
   insights_status: "pending" | "ready" | "failed";
   error: { code: string; message: string } | null;
+  warnings: { code: string; message: string }[];
   page_count: number | null;
   chunk_count: number;
   token_count: number;

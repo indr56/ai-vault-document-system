@@ -177,6 +177,19 @@ def run_pipeline(document_id: uuid.UUID, *, task_id: str | None, is_final_attemp
             return _process(db, document, task_id=task_id, is_final_attempt=is_final_attempt)
 
 
+def _pages_without_text_warning(pages: list[int]) -> dict[str, str]:
+    listed = ", ".join(str(p) for p in pages)
+    if len(pages) == 1:
+        subject, what, verb = f"Page {listed}", "a scanned image", "is"
+    else:
+        subject, what, verb = f"Pages {listed}", "scanned images", "are"
+    return {
+        "code": "pages_without_text",
+        "message": f"{subject} had no extractable text (probably {what}) and {verb} not searchable; "
+        "OCR is not supported yet.",
+    }
+
+
 def _process(db: Session, document: Document, *, task_id: str | None, is_final_attempt: bool) -> PipelineResult:
     settings = get_settings()
     document.status = DocumentStatus.PROCESSING
@@ -202,6 +215,10 @@ def _process(db: Session, document: Document, *, task_id: str | None, is_final_a
             parsed: ParsedDocument = parse_document(get_storage().path(document.storage_path), document.extension)
             details["pages"] = len(parsed.pages)
             document.page_count = parsed.page_count
+            document.warnings = []
+            if parsed.pages_without_text:
+                details["pages_without_text"] = parsed.pages_without_text
+                document.warnings = [_pages_without_text_warning(parsed.pages_without_text)]
 
         with recorder.stage(ProcessingStage.CHUNK) as details:
             chunks = chunk_document(parsed, settings.chunk_size_tokens, settings.chunk_overlap_tokens)

@@ -174,7 +174,7 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
                         {d.status === "failed"
                           ? d.error?.message
                           : d.status === "ready"
-                            ? `${d.page_count ? `${d.page_count} pages · ` : ""}${d.chunk_count} chunk${d.chunk_count === 1 ? "" : "s"} · ${((d.processing_ms ?? 0) / 1000).toFixed(1)}s`
+                            ? `${d.page_count ? `${d.page_count} pages · ` : ""}${d.chunk_count} chunk${d.chunk_count === 1 ? "" : "s"} · ${((d.processing_ms ?? 0) / 1000).toFixed(1)}s${d.warnings?.length ? " · ⚠ some pages not searchable" : ""}`
                             : ""}
                       </td>
                     )}
@@ -308,6 +308,11 @@ function DocumentDetail({
             <strong>{doc.error.code}</strong> — {doc.error.message}
           </div>
         )}
+        {doc.warnings?.map((w) => (
+          <div key={w.code} className="alert warn">
+            {w.message}
+          </div>
+        ))}
         <div className="row">
           <button className="btn primary sm" disabled={doc.status !== "ready"} onClick={onChat}>
             Chat about this

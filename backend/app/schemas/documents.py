@@ -25,6 +25,9 @@ class DocumentOut(BaseModel):
     stage: str | None = Field(description="Current pipeline stage while processing: parse | chunk | embed | analyze")
     insights_status: str = Field(description="pending | ready | failed (chat works even if insights failed)")
     error: DocumentError | None = None
+    warnings: list[DocumentError] = Field(
+        default_factory=list, description="Non-fatal problems, e.g. pages_without_text (scanned pages not searchable)"
+    )
     page_count: int | None
     chunk_count: int
     token_count: int

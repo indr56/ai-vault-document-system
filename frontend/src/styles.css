@@ -146,6 +146,7 @@ h3 { font-size: 13px; font-weight: 650; color: var(--ink-2); text-transform: upp
 
 .alert { padding: 10px 12px; border-radius: 8px; background: var(--bad-soft); color: var(--bad); font-size: 13px; }
 .alert.info { background: var(--info-soft); color: var(--info); }
+.alert.warn { background: var(--warn-soft); color: var(--warn); }
 .alert.note { display: flex; align-items: center; justify-content: space-between; gap: 12px; animation: fadein 0.2s ease; }
 .note-close { border: 0; background: none; color: inherit; cursor: pointer; opacity: 0.7; font-size: 13px; padding: 2px 4px; }
 .note-close:hover { opacity: 1; }
