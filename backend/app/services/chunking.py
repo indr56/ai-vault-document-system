@@ -29,6 +29,12 @@ def count_tokens(text: str) -> int:
     return len(_encoding().encode(text, disallowed_special=()))
 
 
+def split_by_tokens(text: str, max_tokens: int) -> list[str]:
+    """Hard cut into pieces of at most max_tokens (for blocks too big for one model call)."""
+    tokens = _encoding().encode(text, disallowed_special=())
+    return [_encoding().decode(tokens[i : i + max_tokens]) for i in range(0, len(tokens), max_tokens)]
+
+
 def chunk_document(parsed: ParsedDocument, chunk_size: int, overlap: int) -> list[ChunkData]:
     # Separators prefer paragraph, then line, then sentence boundaries before splitting words.
     splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(

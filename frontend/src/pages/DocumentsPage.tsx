@@ -21,8 +21,8 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
   const pushNotes = (items: Omit<Note, "id">[]) => {
     const withIds = items.map((n) => ({ ...n, id: ++noteSeq }));
     setNotes((n) => [...n, ...withIds]);
-    // Info messages fade after 6 s, errors after 15 s; both can be closed with ✕.
-    withIds.forEach((n) => window.setTimeout(() => dismiss(n.id), n.kind === "info" ? 6000 : 15000));
+    // Info messages stay 25 s, errors 30 s, long enough to read a batch result; ✕ closes one sooner.
+    withIds.forEach((n) => window.setTimeout(() => dismiss(n.id), n.kind === "info" ? 25_000 : 30_000));
   };
   const [filter, setFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
@@ -53,6 +53,11 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
         const res = await post<UploadResult>("/documents", form);
         next.push({ kind: "info", text: `${files[0].name}: ${res.message}` });
         if (replaces) setSelectedId(res.document.id);
+        else if (res.duplicate) {
+          // Show the document the file matched; it may be an older version the list hides.
+          if (!res.document.is_latest) setExtraDoc(res.document);
+          setSelectedId(res.document.id);
+        }
       } else {
         const form = new FormData();
         files.forEach((f) => form.append("files", f));
@@ -64,7 +69,9 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
         res.errors.forEach((e) => next.push({ kind: "error", text: `${e.filename}: ${e.message}` }));
       }
     } catch (e) {
-      next.push({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+      // Name the file, as batch errors do; a whole-batch failure (e.g. too many files) has no single file.
+      const label = files.length === 1 || replaces ? `${files[0].name}: ` : "";
+      next.push({ kind: "error", text: label + (e instanceof Error ? e.message : String(e)) });
     } finally {
       setUploading(false);
       pushNotes(next);

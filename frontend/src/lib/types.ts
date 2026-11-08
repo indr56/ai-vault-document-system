@@ -124,6 +124,8 @@ export interface VaultEvent {
   type: string;
   document_id?: string;
   comparison_id?: string;
+  session_id?: string;
+  message_id?: string;
   stage?: string;
   error_message?: string;
 }

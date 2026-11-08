@@ -1,15 +1,20 @@
 """Grounded multi-document chat (RAG).
 
 Flow for every question:
-    1. Rewrite a follow-up into a standalone question using recent history (fast model).
-    2. Answer cache lookup (same documents + same standalone question).
-    3. Embed the question (cached) -> hybrid retrieval over the session's ready documents.
+    1. Rewrite a follow-up into a standalone question using recent history (fast model) - only
+       when it refers back to the conversation ("what does IT cover?", "and for fire?").
+    2. Answer cache lookup (exact: same documents + same standalone question; then similar meaning).
+    3. Embed the question (cached) -> hybrid retrieval over the session's ready documents
+       (documents not ready yet are reported as skipped_documents).
     4. Drop weak evidence; if nothing relevant remains, abstain without calling the model.
     5. Generate the answer with numbered sources, then map [n] citations back to chunks.
-    6. Suggest follow-up questions the documents can answer.
-Both the blocking and the streaming (SSE) endpoints share steps 1-4 and 5's post-processing.
+    6. Suggest follow-up questions the documents can answer - generated together with step 5; once
+       the answer is known, the 3 that add the most beyond it are shown.
+Both the blocking and the streaming (SSE) endpoints share these steps. If an answer fails or the
+client disconnects, the question, any partial answer and the calls already paid for are still saved.
 """
 
+import asyncio
 import re
 import time
 import uuid
@@ -33,9 +38,9 @@ from app.llm.prompts import rewrite as rewrite_prompt
 from app.llm.schemas import FollowUpQuestions
 from app.models import ChatMessage, ChatSession, Document, DocumentInsight, User
 from app.models.enums import DocumentStatus, MessageRole
-from app.services import cache
+from app.services import cache, events
 from app.services.chunking import count_tokens
-from app.services.documents import get_ready_documents
+from app.services.documents import get_owned_documents
 from app.services.retrieval import RetrievedChunk, hybrid_search
 from app.services.usage import UsageEntry, add_entries, failed_calls_to
 
@@ -48,13 +53,16 @@ SNIPPET_CHARS = 300
 # --------------------------------------------------------------------------- sessions
 async def create_session(db: AsyncSession, user: User, document_ids: list[uuid.UUID], title: str | None) -> ChatSession:
     unique_ids = list(dict.fromkeys(document_ids))
-    documents = await get_ready_documents(db, user, unique_ids)
+    # Documents may still be processing: the chat can be opened now and answers use whichever are
+    # ready at question time (the others are reported as skipped_documents).
+    documents = await get_owned_documents(db, user, unique_ids)
     if not title:
         title = documents[0].title if len(documents) == 1 else f"{documents[0].title} + {len(documents) - 1} more"
     session = ChatSession(owner_id=user.id, title=title[:255], documents=documents)
     db.add(session)
     await db.commit()
     await db.refresh(session)
+    await events.apublish(user.id, "chat.session_created", {"session_id": session.id})
     return session
 
 
@@ -97,6 +105,7 @@ async def delete_session(db: AsyncSession, user: User, session_id: uuid.UUID) ->
     session = await get_session(db, user, session_id)
     await db.delete(session)
     await db.commit()
+    await events.apublish(user.id, "chat.session_deleted", {"session_id": session_id})
 
 
 # --------------------------------------------------------------------------- preparation
@@ -113,6 +122,7 @@ class PreparedQuestion:
     embedding: list[float] | None = None
     cached: dict[str, Any] | None = None
     cache_match: dict[str, Any] | None = None  # how a cached answer was found (exact / similar question)
+    skipped_documents: list[dict[str, Any]] = field(default_factory=list)  # in the chat but not ready
     retrieval_ms: int = 0
     usages: list[UsageEntry] = field(default_factory=list)  # every call made (or avoided by a cache)
 
@@ -135,6 +145,24 @@ async def _embed_query(text: str, prepared: PreparedQuestion) -> list[float]:
     return result.vectors[0]
 
 
+# Words and openings that only make sense with the conversation ("what does IT cover?", "and for
+# fire?"). A follow-up without any of them is already standalone, so the rewrite call is skipped.
+_REFERRING = re.compile(
+    r"\b(it|its|it's|they|them|their|theirs|this|that|these|those|he|she|him|her|his|hers|one|ones|"
+    r"former|latter|above|previous|same|other|else|also|too|instead|there|then|so)\b",
+    re.IGNORECASE,
+)
+_CONTINUATION = re.compile(r"^\s*(and|or|but|what about|how about|why|why not|ok|okay)\b", re.IGNORECASE)
+SHORT_FOLLOW_UP_WORDS = 4  # "for fire?", "the deductible?" - too short to stand alone
+
+
+def needs_rewrite(question: str) -> bool:
+    words = re.findall(r"[\w'$%.-]+", question)
+    return (
+        len(words) <= SHORT_FOLLOW_UP_WORDS or bool(_CONTINUATION.search(question)) or bool(_REFERRING.search(question))
+    )
+
+
 def _is_relevant(chunk: RetrievedChunk, threshold: float) -> bool:
     return chunk.keyword_match or chunk.similarity >= threshold
 
@@ -152,6 +180,11 @@ async def prepare_question(
     question = question.strip()
 
     ready = [d for d in session.documents if d.status == DocumentStatus.READY]
+    skipped = [
+        {"document_id": str(d.id), "title": d.title, "status": d.status}
+        for d in session.documents
+        if d.status != DocumentStatus.READY
+    ]
     if not ready:
         raise NotReadyError(
             "None of the documents in this chat are ready yet. Wait for processing to finish.",
@@ -162,10 +195,11 @@ async def prepare_question(
     prepared = PreparedQuestion(
         question=question, standalone_question=question, documents=ready, history=_history_messages(previous)
     )
+    prepared.skipped_documents = skipped
     if usages is not None:
         prepared.usages = usages  # the caller's list, so it still sees the calls made if a later step fails
 
-    if prepared.history:
+    if prepared.history and needs_rewrite(question):
         with failed_calls_to(prepared.usages.append, "rewrite_query", provider.fast_model, rewrite_prompt.VERSION):
             rewrite = await provider.acomplete(
                 rewrite_prompt.build_messages(prepared.history, question), model=provider.fast_model, max_tokens=200
@@ -174,10 +208,10 @@ async def prepare_question(
         prepared.standalone_question = rewrite.text.strip() or question
 
     versions = [f"{d.id}:{d.processed_at.isoformat() if d.processed_at else ''}" for d in ready]
-    prepared.cache_key = cache.answer_cache_key(
-        str(user.id), versions, prepared.standalone_question, chat_prompt.VERSION
-    )
-    prepared.semantic_index_key = cache.semantic_index_key(str(user.id), versions, chat_prompt.VERSION)
+    # A cached entry holds the answer AND its follow-ups, so a change to either prompt starts fresh.
+    prompts = f"{chat_prompt.VERSION}+{followups_prompt.VERSION}"
+    prepared.cache_key = cache.answer_cache_key(str(user.id), versions, prepared.standalone_question, prompts)
+    prepared.semantic_index_key = cache.semantic_index_key(str(user.id), versions, prompts)
     if use_cache:
         prepared.cached = await cache.aget_json(prepared.cache_key)
         if prepared.cached is not None:
@@ -261,20 +295,18 @@ async def _insight_questions(db: AsyncSession, documents: list[Document]) -> lis
         .scalars()
         .all()
     )
-    return [q for questions in rows for q in (questions or [])][:3]
+    return [q for questions in rows for q in (questions or [])][:10]
 
 
-async def suggest_follow_ups(db: AsyncSession, prepared: PreparedQuestion, answer: str, abstained: bool) -> list[str]:
-    """Best effort: a failure here must never fail the answer."""
-    if abstained or not prepared.sources:
-        return await _insight_questions(db, prepared.documents)
+async def _llm_follow_ups(prepared: PreparedQuestion) -> list[str]:
+    """Follow-up questions from the question and the top sources. Needs no DB session and not the
+    answer, so it runs concurrently with answer generation. Best effort: failure -> no suggestions."""
     provider = get_provider()
+    top = prepared.sources[: followups_prompt.MAX_SOURCES]
     try:
         with failed_calls_to(prepared.usages.append, "follow_ups", provider.fast_model, followups_prompt.VERSION):
             result = await provider.acomplete_structured(
-                followups_prompt.build_messages(
-                    prepared.standalone_question, answer, chat_prompt.format_sources(prepared.sources)
-                ),
+                followups_prompt.build_messages(prepared.standalone_question, chat_prompt.format_sources(top)),
                 FollowUpQuestions,
                 model=provider.fast_model,
                 max_tokens=200,
@@ -283,7 +315,138 @@ async def suggest_follow_ups(db: AsyncSession, prepared: PreparedQuestion, answe
         logger.warning("follow_ups_failed", exc_info=True)
         return []
     prepared.usages.append(UsageEntry("follow_ups", result.usage, followups_prompt.VERSION))
-    return [q.strip() for q in result.value.questions if q.strip()][:3]
+    return [q.strip() for q in result.value.questions if q.strip()][: followups_prompt.CANDIDATES]
+
+
+FOLLOW_UPS_SHOWN = 3
+# A candidate this close in meaning to the answer restates it ("Is the flood deductible per
+# occurrence?" after "The flood deductible is $50,000 per occurrence" scored 0.84); measured on
+# text-embedding-3-small, genuine follow-ups scored at most 0.61 against the answer.
+FOLLOW_UP_REPEAT_SIMILARITY = 0.75
+
+
+async def pick_follow_ups(prepared: PreparedQuestion, answer: str, candidates: list[str]) -> list[str]:
+    """Keep the suggestions that add the most beyond the answer.
+
+    One embedding call (the answer + the candidates, ~100 tokens) and a cosine against the answer:
+    candidates above FOLLOW_UP_REPEAT_SIMILARITY are dropped, and of the rest the 3 least similar to
+    the answer are kept, in the model's original order. Within one question, candidates that restate
+    the answer are consistently the closest to it, so ranking separates them where a single global
+    threshold can't. Best effort: if the call fails, the first 3 are shown unfiltered.
+    """
+    if not candidates:
+        return []
+    provider = get_provider()
+    try:
+        with failed_calls_to(prepared.usages.append, "embed_follow_ups", provider.embedding_model):
+            result = await provider.aembed([answer, *candidates])
+    except Exception:
+        logger.warning("follow_ups_rank_failed", exc_info=True)
+        return candidates[:FOLLOW_UPS_SHOWN]
+    prepared.usages.append(UsageEntry("embed_follow_ups", result.usage))
+    answer_vector, vectors = result.vectors[0], result.vectors[1:]
+    scored = [
+        (cache.cosine(answer_vector, vector), i)
+        for i, vector in enumerate(vectors)
+        if cache.cosine(answer_vector, vector) < FOLLOW_UP_REPEAT_SIMILARITY
+    ]
+    keep = sorted(i for _, i in sorted(scored)[:FOLLOW_UPS_SHOWN])
+    return [candidates[i] for i in keep]
+
+
+def _start_follow_ups(prepared: PreparedQuestion) -> "asyncio.Task[list[str]] | None":
+    """Started right before the answer call; None when there is nothing to base suggestions on."""
+    return asyncio.create_task(_llm_follow_ups(prepared)) if prepared.sources else None
+
+
+_WORD = re.compile(r"[a-z0-9$%]+")
+_FILLER = {
+    "a",
+    "an",
+    "the",
+    "is",
+    "are",
+    "was",
+    "be",
+    "do",
+    "does",
+    "did",
+    "what",
+    "which",
+    "who",
+    "whom",
+    "when",
+    "where",
+    "why",
+    "how",
+    "for",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "by",
+    "and",
+    "or",
+    "if",
+    "it",
+    "this",
+    "that",
+    "there",
+    "any",
+    "must",
+    "should",
+    "can",
+    "i",
+    "we",
+    "you",
+    "my",
+    "our",
+    "with",
+    "from",
+    "after",
+    "before",
+}
+
+
+def _content_words(text: str) -> set[str]:
+    return {w for w in _WORD.findall(text.lower()) if w not in _FILLER}
+
+
+def _already_asked(suggestion: str, asked: list[str]) -> bool:
+    """True if the suggestion asks something the user already asked in this chat: every content word
+    of one is in the other ("How long must damaged stock be kept?" vs "How long must damaged stock be
+    kept for insurer inspection?")."""
+    words = _content_words(suggestion)
+    for question in asked:
+        other = _content_words(question)
+        if len(other) >= 2 and (other <= words or words <= other):
+            return True
+    return False
+
+
+def _asked_questions(prepared: PreparedQuestion) -> list[str]:
+    earlier = [str(m["content"]) for m in prepared.history if m["role"] == MessageRole.USER]
+    return [*earlier, prepared.question, prepared.standalone_question]
+
+
+async def _finish_follow_ups(
+    db: AsyncSession,
+    prepared: PreparedQuestion,
+    task: "asyncio.Task[list[str]] | None",
+    answer: str,
+    abstained: bool,
+) -> list[str]:
+    asked = _asked_questions(prepared)
+    if abstained or task is None:
+        if task is not None:
+            await task  # already paid for; let it finish so its usage is recorded, but don't show it
+        # "Not found": suggest what IS covered, minus what the user already asked.
+        return [q for q in await _insight_questions(db, prepared.documents) if not _already_asked(q, asked)][
+            :FOLLOW_UPS_SHOWN
+        ]
+    candidates = [q for q in await task if not _already_asked(q, asked)]
+    return await pick_follow_ups(prepared, answer, candidates)
 
 
 def _abstain_text() -> str:
@@ -328,6 +491,7 @@ async def _save_exchange(
             ],
             "retrieval_ms": prepared.retrieval_ms,
             "cache_match": prepared.cache_match,
+            "skipped_documents": prepared.skipped_documents,
         },
         grounded=bool(citations) and not abstained,
         abstained=abstained,
@@ -343,6 +507,7 @@ async def _save_exchange(
     await db.commit()
     await db.refresh(user_message)
     await db.refresh(assistant)
+    await events.apublish(user.id, "chat.message_created", {"session_id": session.id, "message_id": assistant.id})
     return user_message, assistant
 
 
@@ -403,6 +568,7 @@ class _Attempt:
     answer_messages: list[Message] | None = None  # set when the answer call starts
     answer_parts: list[str] = field(default_factory=list)
     answer_usage: Usage | None = None  # set when the provider reports final usage
+    final_answer: str = ""
     saved: bool = False
 
 
@@ -501,21 +667,27 @@ async def _ask(
         )
 
     answer_usage: Usage | None = None
-    if not prepared.sources:
-        answer = _abstain_text()
-    else:
-        provider = get_provider()
-        attempt.answer_messages = chat_prompt.build_messages(
-            question, prepared.standalone_question, prepared.sources, prepared.history
-        )
-        completion = await provider.acomplete(attempt.answer_messages)  # failure: see _save_interrupted
-        answer, answer_usage = completion.text.strip(), completion.usage
-        attempt.answer_usage = answer_usage
-        prepared.usages.append(UsageEntry("chat_answer", completion.usage, chat_prompt.VERSION))
+    follow_ups_task = _start_follow_ups(prepared)  # runs while the answer is generated
+    try:
+        if not prepared.sources:
+            answer = _abstain_text()
+        else:
+            provider = get_provider()
+            attempt.answer_messages = chat_prompt.build_messages(
+                question, prepared.standalone_question, prepared.sources, prepared.history
+            )
+            completion = await provider.acomplete(attempt.answer_messages)  # failure: see _save_interrupted
+            answer, answer_usage = completion.text.strip(), completion.usage
+            attempt.answer_usage = answer_usage
+            prepared.usages.append(UsageEntry("chat_answer", completion.usage, chat_prompt.VERSION))
+    except BaseException:
+        if follow_ups_task is not None:
+            follow_ups_task.cancel()
+        raise
 
     citations = extract_citations(answer, prepared)
     abstained = answer.startswith(chat_prompt.ABSTAIN_PREFIX)
-    follow_ups = await suggest_follow_ups(db, prepared, answer, abstained)
+    follow_ups = await _finish_follow_ups(db, prepared, follow_ups_task, answer, abstained)
     await _cache_answer(prepared, answer, citations, follow_ups, answer_usage)
     return await _save_exchange(
         db,
@@ -555,10 +727,56 @@ async def _ask_stream(
     yield "status", {"stage": "retrieving"}
     prepared = await prepare_question(db, user, session, question, use_cache, usages=attempt.usages)
     attempt.standalone_question = prepared.standalone_question
-    yield "status", {"stage": "generating", "standalone_question": prepared.standalone_question}
+    yield (
+        "status",
+        {
+            "stage": "generating",
+            "standalone_question": prepared.standalone_question,
+            "skipped_documents": prepared.skipped_documents,
+        },
+    )
 
-    answer_usage: Usage | None = None
     from_cache = prepared.cached is not None
+    follow_ups_task = None if from_cache else _start_follow_ups(prepared)  # runs while tokens stream
+    try:
+        async for item in _generate(prepared, question, attempt, from_cache):
+            yield item
+    except BaseException:
+        if follow_ups_task is not None:
+            follow_ups_task.cancel()
+        raise
+    answer, answer_usage = attempt.final_answer, attempt.answer_usage
+
+    if from_cache:
+        assert prepared.cached is not None
+        citations, follow_ups = prepared.cached["citations"], prepared.cached["follow_ups"]
+    else:
+        citations = extract_citations(answer, prepared)
+        abstained = answer.startswith(chat_prompt.ABSTAIN_PREFIX)
+        follow_ups = await _finish_follow_ups(db, prepared, follow_ups_task, answer, abstained)
+        await _cache_answer(prepared, answer, citations, follow_ups, answer_usage)
+
+    user_message, assistant = await _save_exchange(
+        db,
+        user,
+        session,
+        prepared,
+        answer=answer,
+        citations=citations,
+        follow_ups=follow_ups,
+        answer_usage=answer_usage,
+        from_cache=from_cache,
+        started=started,
+    )
+    attempt.saved = True
+    yield "done", {"question": user_message, "answer": assistant}
+
+
+async def _generate(
+    prepared: PreparedQuestion, question: str, attempt: _Attempt, from_cache: bool
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    """The answer itself: from the cache, a fixed "not found" text, or streamed from the model.
+    Leaves the full text in attempt.final_answer and the provider's usage in attempt.answer_usage."""
     if from_cache:
         assert prepared.cached is not None
         _restore_cached_chunks(prepared)
@@ -577,30 +795,9 @@ async def _ask_stream(
                 attempt.answer_parts.append(event.delta)
                 yield "token", {"text": event.delta}
             if event.usage:
-                answer_usage = attempt.answer_usage = event.usage
+                attempt.answer_usage = event.usage
         answer = "".join(attempt.answer_parts).strip()
-        if answer_usage:
-            prepared.usages.append(UsageEntry("chat_answer", answer_usage, chat_prompt.VERSION))
+        if attempt.answer_usage:
+            prepared.usages.append(UsageEntry("chat_answer", attempt.answer_usage, chat_prompt.VERSION))
 
-    if from_cache:
-        assert prepared.cached is not None
-        citations, follow_ups = prepared.cached["citations"], prepared.cached["follow_ups"]
-    else:
-        citations = extract_citations(answer, prepared)
-        follow_ups = await suggest_follow_ups(db, prepared, answer, answer.startswith(chat_prompt.ABSTAIN_PREFIX))
-        await _cache_answer(prepared, answer, citations, follow_ups, answer_usage)
-
-    user_message, assistant = await _save_exchange(
-        db,
-        user,
-        session,
-        prepared,
-        answer=answer,
-        citations=citations,
-        follow_ups=follow_ups,
-        answer_usage=answer_usage,
-        from_cache=from_cache,
-        started=started,
-    )
-    attempt.saved = True
-    yield "done", {"question": user_message, "answer": assistant}
+    attempt.final_answer = answer

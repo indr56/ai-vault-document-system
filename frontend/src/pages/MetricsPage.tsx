@@ -83,11 +83,25 @@ function Dashboard({ docs, ai, api: apiPerf, system }: { docs: Json; ai: Json; a
         )}
       </div>
 
+      {ai.unpriced_models?.length > 0 && (
+        <div className="alert warn">
+          No price configured for {ai.unpriced_models.join(", ")}: their cost is counted as $0. Add them to MODEL_PRICES.
+        </div>
+      )}
       <div className="tiles">
         <Tile label="Documents" value={num(docs.documents.total)} sub={`${num(docs.documents.total_pages)} pages · ${num(docs.documents.total_chunks)} chunks`} />
         <Tile label="Processing success" value={pct(p.success_rate)} sub={`${p.succeeded} ok · ${p.failed} failed`} />
         <Tile label="Processing time (p50 / p95)" value={ms(p.duration_ms.p50)} sub={`p95 ${ms(p.duration_ms.p95)} · queue wait ${ms(p.avg_queue_wait_ms)}`} />
-        <Tile label="AI cost" value={usd(ai.totals.cost_usd)} sub={`${num(ai.totals.total_tokens)} tokens · ${ai.totals.calls} calls`} />
+        <Tile
+          label="AI cost"
+          value={usd(ai.totals.cost_usd)}
+          sub={`${num(ai.totals.total_tokens)} tokens · ${ai.totals.calls} calls · ${ai.totals.failed_calls} failed`}
+        />
+        <Tile
+          label="Saved by caches"
+          value={usd(ai.cache_savings?.cost_saved_usd)}
+          sub={`${num(ai.cache_savings?.tokens_saved)} tokens · ${num(ai.cache_savings?.hits)} hits`}
+        />
         <Tile label="Chat latency (avg / p95)" value={ms(ai.chat.avg_latency_ms)} sub={`p95 ${ms(ai.chat.p95_latency_ms)} · ${ai.chat.answers} answers`} />
         <Tile label="Grounded answers" value={pct(ai.chat.grounded_rate)} sub={`abstained ${pct(ai.chat.abstention_rate)} · cache hits ${pct(ai.chat.cache_hit_rate)}`} />
       </div>

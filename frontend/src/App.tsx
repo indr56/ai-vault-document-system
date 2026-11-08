@@ -109,8 +109,10 @@ export default function App() {
         {page === "documents" && (
           <DocumentsPage documents={documents} refresh={refreshDocuments} onChat={startChat} lastEvent={lastEvent} />
         )}
-        {page === "chat" && <ChatPage documents={documents} seed={chatSeed} clearSeed={() => setChatSeed(null)} />}
-        {page === "compare" && <ComparePage documents={documents} lastEvent={lastEvent} />}
+        {page === "chat" && (
+          <ChatPage documents={documents} seed={chatSeed} clearSeed={() => setChatSeed(null)} lastEvent={lastEvent} />
+        )}
+        {page === "compare" && <ComparePage documents={documents} lastEvent={lastEvent} connected={connected} />}
         {page === "metrics" && <MetricsPage lastEvent={lastEvent} />}
       </main>
     </div>

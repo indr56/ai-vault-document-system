@@ -3,7 +3,13 @@ import { Empty, ErrorNote } from "../components/ui";
 import { api, post, timeAgo } from "../lib/api";
 import type { Comparison, DocumentItem, VaultEvent } from "../lib/types";
 
-export default function ComparePage({ documents, lastEvent }: { documents: DocumentItem[]; lastEvent: VaultEvent | null }) {
+interface Props {
+  documents: DocumentItem[];
+  lastEvent: VaultEvent | null;
+  connected: boolean;
+}
+
+export default function ComparePage({ documents, lastEvent, connected }: Props) {
   // Include older versions so "v1 vs v2" comparisons are possible.
   const [ready, setReady] = useState<DocumentItem[]>([]);
   useEffect(() => {
@@ -28,16 +34,17 @@ export default function ComparePage({ documents, lastEvent }: { documents: Docum
     load().then((items) => items[0] && setActiveId((id) => id ?? items[0].id), setError);
   }, [load]);
 
-  // Refresh when a comparison finishes (WebSocket) and poll as a fallback while one is running.
+  // Refresh when a comparison finishes (WebSocket). Poll only as a fallback: while one is running
+  // AND the WebSocket is disconnected (same rule as the document list in App).
   useEffect(() => {
     if (lastEvent?.type.startsWith("comparison.")) void load();
   }, [lastEvent, load]);
   const running = history.some((c) => c.status === "pending" || c.status === "running");
   useEffect(() => {
-    if (!running) return;
+    if (!running || connected) return;
     const t = window.setInterval(load, 3000);
     return () => window.clearInterval(t);
-  }, [running, load]);
+  }, [running, connected, load]);
 
   const toggle = (id: string) => setPicked((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id].slice(-5)));
   const start = async () => {

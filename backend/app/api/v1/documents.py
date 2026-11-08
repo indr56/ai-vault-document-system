@@ -8,7 +8,7 @@ from app.core.config import get_settings
 from app.core.errors import AppError, PayloadTooLargeError, ValidationFailedError
 from app.core.rate_limit import rate_limited
 from app.db.session import get_db
-from app.models import Document, User
+from app.models import User
 from app.models.enums import DocumentStatus, InsightsStatus
 from app.schemas.documents import (
     BatchUploadResult,
@@ -43,13 +43,19 @@ async def _read_limited(file: UploadFile) -> bytes:
     return data
 
 
-def _upload_result(document: Document, duplicate: bool) -> UploadResult:
-    message = (
-        "Identical file already in your vault; returning the existing document."
-        if duplicate
-        else "Uploaded. Processing has started; watch `status` or subscribe to /api/v1/events."
-    )
-    return UploadResult(document=DocumentOut.from_model(document), duplicate=duplicate, message=message)
+def _upload_result(outcome: service.UploadOutcome) -> UploadResult:
+    if outcome.reprocessing:
+        message = "This file was uploaded before but failed to process; processing it again."
+    elif outcome.duplicate and outcome.latest_title is not None:
+        message = (
+            f'Identical to version {outcome.document.version} of "{outcome.latest_title}" (an older version) '
+            "already in your vault; returning it."
+        )
+    elif outcome.duplicate:
+        message = "Identical file already in your vault; returning the existing document."
+    else:
+        message = "Uploaded. Processing has started."
+    return UploadResult(document=DocumentOut.from_model(outcome.document), duplicate=outcome.duplicate, message=message)
 
 
 @router.post(
@@ -57,8 +63,9 @@ def _upload_result(document: Document, duplicate: bool) -> UploadResult:
     response_model=UploadResult,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Upload a document (PDF, DOCX, TXT, MD)",
-    description="Stores the file and queues it for processing. Returns immediately (202). "
-    "Pass `replaces_document_id` to upload a new version of an existing document.",
+    description="Stores the file and queues it for processing. Returns immediately (202); follow progress "
+    "with GET /documents/{id}/status or the events WebSocket. Pass `replaces_document_id` to upload a new "
+    "version of an existing document (it keeps that document's title unless `title` is given).",
 )
 async def upload_document(
     db: DB,
@@ -69,12 +76,12 @@ async def upload_document(
     replaces_document_id: uuid.UUID | None = Form(default=None),
 ) -> UploadResult:
     data = await _read_limited(file)
-    document, duplicate = await service.upload_document(
+    outcome = await service.upload_document(
         db, user, filename=file.filename, data=data, title=title, replaces_document_id=replaces_document_id
     )
-    if duplicate:
-        response.status_code = status.HTTP_200_OK
-    return _upload_result(document, duplicate)
+    if outcome.duplicate and not outcome.reprocessing:
+        response.status_code = status.HTTP_200_OK  # nothing new was queued
+    return _upload_result(outcome)
 
 
 @router.post(
@@ -92,8 +99,8 @@ async def upload_batch(db: DB, user: UploadUser, files: list[UploadFile] = File(
     for file in files:
         try:
             data = await _read_limited(file)
-            document, duplicate = await service.upload_document(db, user, filename=file.filename, data=data)
-            results.append(_upload_result(document, duplicate))
+            outcome = await service.upload_document(db, user, filename=file.filename, data=data)
+            results.append(_upload_result(outcome))
         except AppError as exc:
             await db.rollback()
             errors.append({"filename": file.filename or "", "code": exc.code, "message": exc.message})

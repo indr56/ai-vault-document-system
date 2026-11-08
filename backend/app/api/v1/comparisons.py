@@ -13,7 +13,7 @@ from app.db.session import get_db
 from app.models import Comparison, User
 from app.models.enums import DocumentStatus
 from app.schemas.chat import ComparisonCreate, ComparisonOut
-from app.services.documents import get_ready_documents
+from app.services.documents import get_owned_documents
 from app.workers import tasks
 
 logger = get_logger(__name__)
@@ -34,7 +34,7 @@ ChatUser = Annotated[User, Depends(rate_limited("chat"))]
 )
 async def create_comparison(body: ComparisonCreate, db: DB, user: ChatUser) -> ComparisonOut:
     ids = list(dict.fromkeys(body.document_ids))
-    documents = await get_ready_documents(db, user, ids)
+    documents = await get_owned_documents(db, user, ids)
     not_ready = [str(d.id) for d in documents if d.status != DocumentStatus.READY]
     if not_ready:
         raise NotReadyError("All documents must be ready before comparing.", details={"not_ready": not_ready})

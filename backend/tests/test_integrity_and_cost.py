@@ -188,3 +188,13 @@ async def test_new_version_keeps_the_document_title(client: httpx.AsyncClient) -
     ).json()["document"]
     assert v2["title"] == v1["title"] == "lease agreement"  # was "lease agreement FINAL v2"
     assert v2["original_filename"] == "lease_agreement_FINAL_v2.txt"  # the real file name is still kept
+
+
+async def test_duplicate_of_an_older_version_says_which_one(client: httpx.AsyncClient) -> None:
+    v1_bytes = _content("renewal v1")
+    v1 = (await upload(client, "policy_2025.txt", v1_bytes)).json()["document"]
+    await upload(client, "policy_2026.txt", _content("renewal v2"), replaces_document_id=v1["id"])
+    again = (await upload(client, "policy_2025.txt", v1_bytes)).json()
+    assert again["duplicate"] is True and again["document"]["id"] == v1["id"]
+    # Was the generic "Identical file already in your vault" while v1 is hidden from the default list.
+    assert again["message"].startswith('Identical to version 1 of "policy 2025" (an older version)')

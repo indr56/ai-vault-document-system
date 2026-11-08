@@ -4,6 +4,7 @@ deletion, reprocessing and customised summaries. Heavy work is delegated to Cele
 import asyncio
 import hashlib
 import uuid
+from dataclasses import dataclass
 from pathlib import PurePath
 
 from sqlalchemy import Select, func, or_, select, update
@@ -89,7 +90,9 @@ async def get_document(db: AsyncSession, user: User, document_id: uuid.UUID) -> 
     return document
 
 
-async def get_ready_documents(db: AsyncSession, user: User, document_ids: list[uuid.UUID]) -> list[Document]:
+async def get_owned_documents(db: AsyncSession, user: User, document_ids: list[uuid.UUID]) -> list[Document]:
+    """The caller's documents in the given order, whatever their status; 404 if any is missing or
+    not theirs. Callers that need READY documents check status themselves."""
     documents = (
         (await db.execute(select(Document).where(Document.id.in_(document_ids), Document.owner_id == user.id)))
         .scalars()
@@ -195,6 +198,28 @@ def enqueue_processing(document_id: uuid.UUID) -> None:
 VERSION_CONFLICT_RETRIES = 2
 
 
+@dataclass
+class UploadOutcome:
+    document: Document
+    duplicate: bool  # identical content already in the vault: the existing document is returned
+    reprocessing: bool = False  # ... and it had failed, so it is being processed again
+    latest_title: str | None = None  # ... and it is an OLDER version of this (latest) document
+
+
+async def _duplicate_outcome(db: AsyncSession, duplicate: Document) -> UploadOutcome:
+    """An identical file can match an older version, which the default list hides; say which one."""
+    if duplicate.is_latest:
+        return UploadOutcome(duplicate, duplicate=True)
+    latest_title = (
+        await db.execute(
+            select(Document.title).where(
+                Document.version_group_id == duplicate.version_group_id, Document.is_latest.is_(True)
+            )
+        )
+    ).scalar_one_or_none()
+    return UploadOutcome(duplicate, duplicate=True, latest_title=latest_title)
+
+
 async def _find_duplicate(db: AsyncSession, owner_id: uuid.UUID, content_hash: str) -> Document | None:
     return (
         await db.execute(
@@ -214,8 +239,8 @@ async def upload_document(
     data: bytes,
     title: str | None = None,
     replaces_document_id: uuid.UUID | None = None,
-) -> tuple[Document, bool]:
-    """Validate, store and queue a file. Returns (document, is_duplicate).
+) -> "UploadOutcome":
+    """Validate, store and queue a file.
 
     - Duplicate detection: identical content (SHA-256) already in the vault returns the existing
       document instead of storing and paying to process it again.
@@ -223,12 +248,17 @@ async def upload_document(
     """
     extension = validate_upload(filename, data)
     assert filename is not None
-    content_hash = hashlib.sha256(data).hexdigest()
+    # Off the event loop: hashing 25 MB takes tens of milliseconds and would stall other requests.
+    content_hash = await asyncio.to_thread(lambda: hashlib.sha256(data).hexdigest())
 
     owner_id = user.id  # plain values: a rollback below expires ORM objects
     duplicate = await _find_duplicate(db, owner_id, content_hash)
     if duplicate is not None:
-        return duplicate, True
+        if duplicate.status == DocumentStatus.FAILED:
+            # Uploading the same file again is how people retry; treat it as "reprocess" instead of
+            # pointing at a failed document. (A new row isn't possible: the content is unique per owner.)
+            return UploadOutcome(await reprocess_document(db, user, duplicate.id), duplicate=True, reprocessing=True)
+        return await _duplicate_outcome(db, duplicate)
 
     count = (
         await db.execute(select(func.count()).where(Document.owner_id == user.id, Document.is_latest.is_(True)))
@@ -283,7 +313,7 @@ async def upload_document(
             if winner is not None or attempt == VERSION_CONFLICT_RETRIES:
                 await asyncio.to_thread(get_storage().delete, storage_key)  # our copy of the file is unused
                 if winner is not None:
-                    return winner, True
+                    return await _duplicate_outcome(db, winner)
                 raise ConflictError(
                     "Another version of this document was uploaded at the same moment. Please retry.",
                     code="version_conflict",
@@ -291,9 +321,9 @@ async def upload_document(
             logger.info("version_conflict_retry", document_id=str(document_id), attempt=attempt + 1)
     await db.refresh(document)
     await asyncio.to_thread(enqueue_processing, document.id)
-    events.publish(owner_id, "document.queued", {"document_id": document.id})
+    await events.apublish(owner_id, "document.queued", {"document_id": document.id})
     logger.info("document_uploaded", document_id=str(document.id), size=len(data), version=version)
-    return document, False
+    return UploadOutcome(document, duplicate=False)
 
 
 async def reprocess_document(db: AsyncSession, user: User, document_id: uuid.UUID) -> Document:
@@ -351,17 +381,19 @@ async def delete_document(db: AsyncSession, user: User, document_id: uuid.UUID) 
             previous.is_latest = True
     await db.commit()
     await asyncio.to_thread(get_storage().delete, storage_key)
-    events.publish(user.id, "document.deleted", {"document_id": document_id})
+    await events.apublish(user.id, "document.deleted", {"document_id": document_id})
 
 
 # --------------------------------------------------------------------------- summaries
 def _load_summary_text(document_id: uuid.UUID) -> str:
-    """Runs in a thread: re-parse the stored file; long documents are condensed (map step)."""
+    """Runs in a thread: re-parse the stored file; long documents are condensed (map step, whose
+    section notes are cached from when insights were generated, so this is normally fast)."""
     with sync_session() as db:
         document = db.get(Document, document_id)
         assert document is not None
-        parsed = parse_document(get_storage().path(document.storage_path), document.extension)
-        return prepare_analysis_text(db, document, parsed)
+        db.expunge(document)
+    parsed = parse_document(get_storage().path(document.storage_path), document.extension)
+    return prepare_analysis_text(document, parsed)
 
 
 async def custom_summary(

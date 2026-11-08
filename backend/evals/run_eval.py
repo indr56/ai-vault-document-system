@@ -7,6 +7,8 @@ Metrics (deterministic, so runs are comparable across prompt/model changes):
 - citation_doc_acc  the expected document is among the citations
 - citation_page_acc the expected page is cited (when the dataset specifies one)
 - abstention_acc    "not found" exactly when the documents don't contain the answer
+- follow_up_repeat  share of follow-up suggestions that restate the answer (contain one of the
+                    case's expected facts, e.g. "24 hours" after an answer about 24 hours) - lower is better
 - false_abstention  answerable questions the system refused
 - latency p50/p95 and cost per answer (from the metrics API)
 Results are written to evals/results/<timestamp>.json.
@@ -52,6 +54,11 @@ def score(case: dict[str, Any], answer: dict[str, Any], ids: dict[str, str]) -> 
         result["abstention_correct"] = answer["abstained"]
         return result
     result["answer_correct"] = all(any(s.lower() in text for s in group) for group in case["expect"])
+    facts = [s.lower() for group in case["expect"] for s in group]
+    follow_ups = [q.lower() for q in answer.get("follow_up_questions", [])]
+    if follow_ups:
+        result["follow_up_repeats"] = sum(any(f in q for f in facts) for q in follow_ups)
+        result["follow_ups"] = len(follow_ups)
     result["false_abstention"] = answer["abstained"]
     source = case.get("source")
     if source:
@@ -102,6 +109,11 @@ def main() -> None:
         "citation_page_acc": rate(results, "citation_page_correct"),
         "abstention_acc": rate(results, "abstention_correct"),
         "false_abstention": rate(results, "false_abstention"),
+        "follow_up_repeat": (
+            round(sum(r.get("follow_up_repeats", 0) for r in results) / total_follow_ups, 3)
+            if (total_follow_ups := sum(r.get("follow_ups", 0) for r in results))
+            else None
+        ),
         "latency_p50_ms": statistics.median(latencies) if latencies else None,
         "latency_p95_ms": latencies[int(len(latencies) * 0.95) - 1] if latencies else None,
         "cost_usd_total": round(cost, 6),

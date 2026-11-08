@@ -1,15 +1,16 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Empty, ErrorNote } from "../components/ui";
 import { api, post, postStream, timeAgo } from "../lib/api";
-import type { ChatSession, Citation, DocumentItem, Message } from "../lib/types";
+import type { ChatSession, Citation, DocumentItem, Message, VaultEvent } from "../lib/types";
 
 interface Props {
   documents: DocumentItem[];
   seed: string[] | null;
   clearSeed: () => void;
+  lastEvent: VaultEvent | null;
 }
 
-export default function ChatPage({ documents, seed, clearSeed }: Props) {
+export default function ChatPage({ documents, seed, clearSeed, lastEvent }: Props) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -35,6 +36,11 @@ export default function ChatPage({ documents, seed, clearSeed }: Props) {
     },
     [loadSessions],
   );
+
+  // Live: chats created, deleted or answered in another tab show up here without a reload.
+  useEffect(() => {
+    if (lastEvent?.type.startsWith("chat.")) void loadSessions().catch(setError);
+  }, [lastEvent, loadSessions]);
 
   useEffect(() => {
     loadSessions().then((items) => {
@@ -81,7 +87,7 @@ export default function ChatPage({ documents, seed, clearSeed }: Props) {
         {creating || !activeId ? (
           <NewChat documents={documents} onCreate={createSession} />
         ) : (
-          <Conversation key={activeId} sessionId={activeId} onChanged={loadSessions} />
+          <Conversation key={activeId} sessionId={activeId} onChanged={loadSessions} lastEvent={lastEvent} />
         )}
       </div>
     </div>
@@ -125,20 +131,46 @@ interface Pending {
   stage: string;
 }
 
-function Conversation({ sessionId, onChanged }: { sessionId: string; onChanged: () => void }) {
+interface SkippedDocument {
+  document_id: string;
+  title: string;
+  status: string;
+}
+
+function Conversation({
+  sessionId,
+  onChanged,
+  lastEvent,
+}: {
+  sessionId: string;
+  onChanged: () => void;
+  lastEvent: VaultEvent | null;
+}) {
   const [session, setSession] = useState<ChatSession | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [pending, setPending] = useState<Pending | null>(null);
+  const [skipped, setSkipped] = useState<SkippedDocument[]>([]);
   const [error, setError] = useState<unknown>(null);
   const scroller = useRef<HTMLDivElement>(null);
 
+  const loadHistory = useCallback(
+    () =>
+      api<{ session: ChatSession; messages: Message[] }>(`/chat/sessions/${sessionId}`).then((d) => {
+        setSession(d.session);
+        setMessages(d.messages);
+      }, setError),
+    [sessionId],
+  );
+
   useEffect(() => {
-    api<{ session: ChatSession; messages: Message[] }>(`/chat/sessions/${sessionId}`).then((d) => {
-      setSession(d.session);
-      setMessages(d.messages);
-    }, setError);
-  }, [sessionId]);
+    void loadHistory();
+  }, [loadHistory]);
+
+  // An answer saved in another tab for this chat: show it (our own answers arrive via the stream).
+  useEffect(() => {
+    if (lastEvent?.type === "chat.message_created" && lastEvent.session_id === sessionId && !pending) void loadHistory();
+  }, [lastEvent, sessionId, pending, loadHistory]);
 
   useEffect(() => {
     if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight;
@@ -152,8 +184,10 @@ function Conversation({ sessionId, onChanged }: { sessionId: string; onChanged: 
     setPending({ question, answer: "", stage: "Searching documents…" });
     try {
       await postStream(`/chat/sessions/${sessionId}/messages/stream`, { question }, (event, data) => {
-        if (event === "status")
+        if (event === "status") {
           setPending((p) => p && { ...p, stage: data.stage === "retrieving" ? "Searching documents…" : "Writing answer…" });
+          if (data.skipped_documents) setSkipped(data.skipped_documents);
+        }
         else if (event === "token") setPending((p) => p && { ...p, answer: p.answer + data.text });
         else if (event === "done") {
           setMessages((m) => [...m, data.question, data.answer]);
@@ -161,6 +195,7 @@ function Conversation({ sessionId, onChanged }: { sessionId: string; onChanged: 
         } else if (event === "error") {
           setError(new Error(data.message));
           setPending(null);
+          void loadHistory(); // the question and any partial answer were saved
         }
       });
     } catch (e) {
@@ -214,6 +249,11 @@ function Conversation({ sessionId, onChanged }: { sessionId: string; onChanged: 
                 {q}
               </button>
             ))}
+          </div>
+        )}
+        {skipped.length > 0 && (
+          <div className="alert info">
+            Not used for this answer (not ready yet): {skipped.map((d) => `${d.title} (${d.status})`).join(", ")}
           </div>
         )}
         <ErrorNote error={error} />

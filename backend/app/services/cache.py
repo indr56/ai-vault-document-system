@@ -120,6 +120,17 @@ def answer_cache_key(owner_id: str, document_versions: list[str], question: str,
     return f"answer:{owner_id}:{_hash(prompt_version, *sorted(document_versions), normalized)}"
 
 
+@fail_open(default=None)
+def get_json(key: str) -> Any | None:
+    raw = get_redis().get(key)
+    return json.loads(raw) if raw else None  # type: ignore[arg-type]
+
+
+@fail_open(default=None)
+def set_json(key: str, value: Any, ttl: int) -> None:
+    get_redis().set(key, json.dumps(value, default=str), ex=ttl)
+
+
 @afail_open(default=None)
 async def aget_json(key: str) -> Any | None:
     raw = await get_aredis().get(key)
@@ -141,7 +152,7 @@ def semantic_index_key(owner_id: str, document_versions: list[str], prompt_versi
     return f"answer-index:{owner_id}:{_hash(prompt_version, *sorted(document_versions))}"
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
+def cosine(a: list[float], b: list[float]) -> float:
     # OpenAI embeddings are unit-length, so the dot product is the cosine similarity.
     return sum(x * y for x, y in zip(a, b, strict=True))
 
@@ -165,7 +176,7 @@ async def afind_semantic(index_key: str, embedding: list[float]) -> tuple[str, s
     best: tuple[str, str, float] | None = None
     for raw in await get_aredis().lrange(index_key, 0, -1):
         entry = json.loads(raw)
-        similarity = _cosine(embedding, unpack_vector(base64.b64decode(entry["e"])))
+        similarity = cosine(embedding, unpack_vector(base64.b64decode(entry["e"])))
         if similarity >= threshold and (best is None or similarity > best[2]):
             best = (entry["key"], entry["q"], similarity)
     return best
