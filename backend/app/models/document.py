@@ -72,8 +72,15 @@ class Document(UUIDPrimaryKey, Timestamps, Base):
     __table_args__ = (
         Index("ix_documents_owner_created", "owner_id", "created_at"),
         Index("ix_documents_owner_status", "owner_id", "status"),
-        Index("ix_documents_owner_hash", "owner_id", "content_hash"),
-        Index("ix_documents_version_group", "version_group_id", "version"),
+        # Unique: enforce duplicate detection and version numbering in the database (races).
+        Index("uq_documents_owner_hash", "owner_id", "content_hash", unique=True),
+        Index("uq_documents_version_group_version", "version_group_id", "version", unique=True),
+        Index(
+            "uq_documents_one_latest_per_group",
+            "version_group_id",
+            unique=True,
+            postgresql_where=text("is_latest"),
+        ),
     )
 
 

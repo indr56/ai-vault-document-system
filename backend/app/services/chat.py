@@ -34,9 +34,10 @@ from app.llm.schemas import FollowUpQuestions
 from app.models import ChatMessage, ChatSession, Document, DocumentInsight, User
 from app.models.enums import DocumentStatus, MessageRole
 from app.services import cache
+from app.services.chunking import count_tokens
 from app.services.documents import get_ready_documents
 from app.services.retrieval import RetrievedChunk, hybrid_search
-from app.services.usage import arecord_usage
+from app.services.usage import UsageEntry, add_entries, failed_calls_to
 
 logger = get_logger(__name__)
 
@@ -113,7 +114,7 @@ class PreparedQuestion:
     cached: dict[str, Any] | None = None
     cache_match: dict[str, Any] | None = None  # how a cached answer was found (exact / similar question)
     retrieval_ms: int = 0
-    usages: list[tuple[str, Usage, str | None]] = field(default_factory=list)  # (operation, usage, prompt_version)
+    usages: list[UsageEntry] = field(default_factory=list)  # every call made (or avoided by a cache)
 
 
 def _history_messages(messages: list[ChatMessage]) -> list[Message]:
@@ -124,9 +125,12 @@ async def _embed_query(text: str, prepared: PreparedQuestion) -> list[float]:
     provider = get_provider()
     cached = await cache.aget_cached_embedding(provider.embedding_model, text)
     if cached is not None:
+        saved = Usage(provider.embedding_model, prompt_tokens=count_tokens(text))
+        prepared.usages.append(UsageEntry("embed_query", saved, cached=True))
         return cached
-    result = await provider.aembed([text])
-    prepared.usages.append(("embed_query", result.usage, None))
+    with failed_calls_to(prepared.usages.append, "embed_query", provider.embedding_model):
+        result = await provider.aembed([text])
+    prepared.usages.append(UsageEntry("embed_query", result.usage))
     await cache.aset_cached_embedding(provider.embedding_model, text, result.vectors[0])
     return result.vectors[0]
 
@@ -141,7 +145,7 @@ async def prepare_question(
     session: ChatSession,
     question: str,
     use_cache: bool = True,
-    usages: list[tuple[str, Usage, str | None]] | None = None,
+    usages: list[UsageEntry] | None = None,
 ) -> PreparedQuestion:
     settings = get_settings()
     provider = get_provider()
@@ -162,10 +166,11 @@ async def prepare_question(
         prepared.usages = usages  # the caller's list, so it still sees the calls made if a later step fails
 
     if prepared.history:
-        rewrite = await provider.acomplete(
-            rewrite_prompt.build_messages(prepared.history, question), model=provider.fast_model, max_tokens=200
-        )
-        prepared.usages.append(("rewrite_query", rewrite.usage, rewrite_prompt.VERSION))
+        with failed_calls_to(prepared.usages.append, "rewrite_query", provider.fast_model, rewrite_prompt.VERSION):
+            rewrite = await provider.acomplete(
+                rewrite_prompt.build_messages(prepared.history, question), model=provider.fast_model, max_tokens=200
+            )
+        prepared.usages.append(UsageEntry("rewrite_query", rewrite.usage, rewrite_prompt.VERSION))
         prepared.standalone_question = rewrite.text.strip() or question
 
     versions = [f"{d.id}:{d.processed_at.isoformat() if d.processed_at else ''}" for d in ready]
@@ -265,18 +270,19 @@ async def suggest_follow_ups(db: AsyncSession, prepared: PreparedQuestion, answe
         return await _insight_questions(db, prepared.documents)
     provider = get_provider()
     try:
-        result = await provider.acomplete_structured(
-            followups_prompt.build_messages(
-                prepared.standalone_question, answer, chat_prompt.format_sources(prepared.sources)
-            ),
-            FollowUpQuestions,
-            model=provider.fast_model,
-            max_tokens=200,
-        )
+        with failed_calls_to(prepared.usages.append, "follow_ups", provider.fast_model, followups_prompt.VERSION):
+            result = await provider.acomplete_structured(
+                followups_prompt.build_messages(
+                    prepared.standalone_question, answer, chat_prompt.format_sources(prepared.sources)
+                ),
+                FollowUpQuestions,
+                model=provider.fast_model,
+                max_tokens=200,
+            )
     except Exception:
         logger.warning("follow_ups_failed", exc_info=True)
         return []
-    prepared.usages.append(("follow_ups", result.usage, followups_prompt.VERSION))
+    prepared.usages.append(UsageEntry("follow_ups", result.usage, followups_prompt.VERSION))
     return [q.strip() for q in result.value.questions if q.strip()][:3]
 
 
@@ -332,10 +338,7 @@ async def _save_exchange(
         latency_ms=int((time.perf_counter() - started) * 1000),
     )
     db.add(assistant)
-    for operation, usage, prompt_version in prepared.usages:
-        await arecord_usage(
-            db, usage, operation=operation, owner_id=user.id, session_id=session.id, prompt_version=prompt_version
-        )
+    add_entries(db, prepared.usages, owner_id=user.id, session_id=session.id)  # same transaction as the messages
     session.updated_at = utcnow()
     await db.commit()
     await db.refresh(user_message)
@@ -344,7 +347,11 @@ async def _save_exchange(
 
 
 async def _cache_answer(
-    prepared: PreparedQuestion, answer: str, citations: list[dict[str, Any]], follow_ups: list[str]
+    prepared: PreparedQuestion,
+    answer: str,
+    citations: list[dict[str, Any]],
+    follow_ups: list[str],
+    answer_usage: Usage | None = None,
 ) -> None:
     if answer.strip().startswith(chat_prompt.ABSTAIN_PREFIX):
         return  # don't pin a "not found" answer; a new document version might answer it
@@ -354,6 +361,8 @@ async def _cache_answer(
             "answer": answer,
             "citations": citations,
             "follow_ups": follow_ups,
+            # What a cache hit avoids paying for (recorded as a cached=true usage row on each hit).
+            "usage": answer_usage.__dict__ if answer_usage else None,
             "chunks": [
                 c.__dict__ | {"chunk_id": str(c.chunk_id), "document_id": str(c.document_id)} for c in prepared.chunks
             ],
@@ -368,6 +377,8 @@ async def _cache_answer(
 
 def _restore_cached_chunks(prepared: PreparedQuestion) -> None:
     assert prepared.cached is not None
+    if saved := prepared.cached.get("usage"):
+        prepared.usages.append(UsageEntry("chat_answer", Usage(**saved), chat_prompt.VERSION, cached=True))
     prepared.chunks = [
         RetrievedChunk(**(c | {"chunk_id": uuid.UUID(c["chunk_id"]), "document_id": uuid.UUID(c["document_id"])}))
         for c in prepared.cached.get("chunks", [])
@@ -387,7 +398,7 @@ class _Attempt:
     user_id: uuid.UUID
     session_id: uuid.UUID
     question: str
-    usages: list[tuple[str, Usage, str | None]] = field(default_factory=list)
+    usages: list[UsageEntry] = field(default_factory=list)
     standalone_question: str | None = None
     answer_messages: list[Message] | None = None  # set when the answer call starts
     answer_parts: list[str] = field(default_factory=list)
@@ -404,7 +415,6 @@ async def _save_interrupted(attempt: _Attempt, reason: str) -> None:
     if attempt.saved or (not attempt.usages and attempt.answer_messages is None):
         return  # nothing was spent and no answer started (e.g. no document is ready): nothing to keep
     from app.db.session import get_async_sessionmaker
-    from app.services.chunking import count_tokens
 
     async with get_async_sessionmaker()() as db:
         if await db.get(ChatSession, attempt.session_id) is None:
@@ -426,29 +436,20 @@ async def _save_interrupted(attempt: _Attempt, reason: str) -> None:
                 from_cache=False,
             )
         )
-        for operation, usage, prompt_version in attempt.usages:
-            await arecord_usage(
-                db,
-                usage,
-                operation=operation,
-                owner_id=attempt.user_id,
-                session_id=attempt.session_id,
-                prompt_version=prompt_version,
-            )
+        add_entries(db, attempt.usages, owner_id=attempt.user_id, session_id=attempt.session_id)
         if attempt.answer_messages is not None and attempt.answer_usage is None:
-            estimate = Usage(
-                model=get_provider().chat_model,
-                prompt_tokens=sum(count_tokens(str(m["content"])) for m in attempt.answer_messages),
-                completion_tokens=count_tokens(partial),
-            )
-            await arecord_usage(
+            # The answer call itself failed or was cut off. The provider reports usage only at the end
+            # of a stream, so estimate locally: nothing generated -> nothing billed; otherwise the
+            # prompt plus the tokens streamed so far.
+            estimate = Usage(model=get_provider().chat_model)
+            if partial:
+                estimate.prompt_tokens = sum(count_tokens(str(m["content"])) for m in attempt.answer_messages)
+                estimate.completion_tokens = count_tokens(partial)
+            add_entries(
                 db,
-                estimate,
-                operation="chat_answer",
+                [UsageEntry("chat_answer", estimate, chat_prompt.VERSION, success=False)],
                 owner_id=attempt.user_id,
                 session_id=attempt.session_id,
-                prompt_version=chat_prompt.VERSION,
-                success=False,
             )
         await db.commit()
     attempt.saved = True
@@ -507,15 +508,15 @@ async def _ask(
         attempt.answer_messages = chat_prompt.build_messages(
             question, prepared.standalone_question, prepared.sources, prepared.history
         )
-        completion = await provider.acomplete(attempt.answer_messages)
+        completion = await provider.acomplete(attempt.answer_messages)  # failure: see _save_interrupted
         answer, answer_usage = completion.text.strip(), completion.usage
         attempt.answer_usage = answer_usage
-        prepared.usages.append(("chat_answer", completion.usage, chat_prompt.VERSION))
+        prepared.usages.append(UsageEntry("chat_answer", completion.usage, chat_prompt.VERSION))
 
     citations = extract_citations(answer, prepared)
     abstained = answer.startswith(chat_prompt.ABSTAIN_PREFIX)
     follow_ups = await suggest_follow_ups(db, prepared, answer, abstained)
-    await _cache_answer(prepared, answer, citations, follow_ups)
+    await _cache_answer(prepared, answer, citations, follow_ups, answer_usage)
     return await _save_exchange(
         db,
         user,
@@ -579,7 +580,7 @@ async def _ask_stream(
                 answer_usage = attempt.answer_usage = event.usage
         answer = "".join(attempt.answer_parts).strip()
         if answer_usage:
-            prepared.usages.append(("chat_answer", answer_usage, chat_prompt.VERSION))
+            prepared.usages.append(UsageEntry("chat_answer", answer_usage, chat_prompt.VERSION))
 
     if from_cache:
         assert prepared.cached is not None
@@ -587,7 +588,7 @@ async def _ask_stream(
     else:
         citations = extract_citations(answer, prepared)
         follow_ups = await suggest_follow_ups(db, prepared, answer, answer.startswith(chat_prompt.ABSTAIN_PREFIX))
-        await _cache_answer(prepared, answer, citations, follow_ups)
+        await _cache_answer(prepared, answer, citations, follow_ups, answer_usage)
 
     user_message, assistant = await _save_exchange(
         db,

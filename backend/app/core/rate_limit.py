@@ -47,7 +47,9 @@ async def check_daily_token_quota(db: AsyncSession, user: User) -> None:
     used = (
         await db.execute(
             select(func.coalesce(func.sum(AIUsage.total_tokens), 0)).where(
-                AIUsage.owner_id == user.id, AIUsage.created_at >= since
+                AIUsage.owner_id == user.id,
+                AIUsage.created_at >= since,
+                AIUsage.cached.is_(False),  # tokens a cache saved are not spent
             )
         )
     ).scalar_one()

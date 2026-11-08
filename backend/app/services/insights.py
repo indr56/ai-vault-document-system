@@ -1,6 +1,8 @@
 """AI document understanding (runs in the worker): summary, category, tags, key facts with pages,
 entities, sentiment and suggested questions. Long documents use map-reduce."""
 
+from collections.abc import Callable
+
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -11,7 +13,7 @@ from app.llm.schemas import InsightsOutput, SectionNotes
 from app.models import Document, DocumentInsight
 from app.services.chunking import count_tokens
 from app.services.parsing import ParsedDocument
-from app.services.usage import record_usage
+from app.services.usage import UsageEntry, failed_calls_to, record_entry, record_usage
 
 logger = get_logger(__name__)
 
@@ -35,6 +37,10 @@ def _split_sections(parsed: ParsedDocument, max_tokens: int) -> list[str]:
     return sections
 
 
+def _failure_sink(document: Document) -> Callable[[UsageEntry], None]:
+    return lambda entry: record_entry(entry, owner_id=document.owner_id, document_id=document.id)
+
+
 def prepare_analysis_text(db: Session, document: Document, parsed: ParsedDocument) -> str:
     """Full text when it fits the budget; otherwise condensed section notes (map step)."""
     settings = get_settings()
@@ -43,12 +49,13 @@ def prepare_analysis_text(db: Session, document: Document, parsed: ParsedDocumen
         return text
 
     provider = get_provider()
+    sink = _failure_sink(document)
     notes: list[str] = []
     for section in _split_sections(parsed, SECTION_TOKENS):
         messages = insights_prompt.build_section_notes_messages(document.title, section)
-        result = provider.complete_structured(messages, SectionNotes, model=provider.fast_model, max_tokens=1500)
+        with failed_calls_to(sink, "insights_section_notes", provider.fast_model, insights_prompt.VERSION):
+            result = provider.complete_structured(messages, SectionNotes, model=provider.fast_model, max_tokens=1500)
         record_usage(
-            db,
             result.usage,
             operation="insights_section_notes",
             owner_id=document.owner_id,
@@ -63,11 +70,11 @@ def prepare_analysis_text(db: Session, document: Document, parsed: ParsedDocumen
 def generate_insights(db: Session, document: Document, parsed: ParsedDocument) -> DocumentInsight:
     provider = get_provider()
     text = prepare_analysis_text(db, document, parsed)
-    result = provider.complete_structured(
-        insights_prompt.build_messages(document.title, text), InsightsOutput, max_tokens=2500
-    )
+    with failed_calls_to(_failure_sink(document), "insights", provider.chat_model, insights_prompt.VERSION):
+        result = provider.complete_structured(
+            insights_prompt.build_messages(document.title, text), InsightsOutput, max_tokens=2500
+        )
     record_usage(
-        db,
         result.usage,
         operation="insights",
         owner_id=document.owner_id,

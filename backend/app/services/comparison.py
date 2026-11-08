@@ -14,15 +14,17 @@ from app.core.logging import get_logger
 from app.db.base import utcnow
 from app.db.session import sync_session
 from app.llm import get_provider
+from app.llm.base import Usage
 from app.llm.prompts import comparison as comparison_prompt
 from app.llm.schemas import ComparisonOutput
 from app.models import Comparison, Document, DocumentInsight
 from app.models.enums import ComparisonStatus
 from app.services import events
 from app.services.cache import get_cached_embeddings, set_cached_embeddings
+from app.services.chunking import count_tokens
 from app.services.jobs import TransientJobError, clear_enqueued, redis_lock
 from app.services.retrieval import hybrid_search_sync
-from app.services.usage import record_usage
+from app.services.usage import failed_calls_to, record_entry, record_usage
 
 logger = get_logger(__name__)
 
@@ -33,16 +35,21 @@ CHUNKS_PER_DOCUMENT = 8
 LABELS = "ABCDEFGHIJ"
 
 
-def _embed_focus(db: Session, comparison: Comparison) -> tuple[str, list[float]]:
+def _embed_focus(comparison: Comparison) -> tuple[str, list[float]]:
     """Embed the focus once per comparison (cached across comparisons) and record its cost."""
     provider = get_provider()
     query = comparison.focus or DEFAULT_FOCUS_QUERY
     cached = get_cached_embeddings(provider.embedding_model, [query])[0]
     if cached is not None:
+        saved = Usage(provider.embedding_model, prompt_tokens=count_tokens(query))
+        record_usage(saved, operation="embed_query", owner_id=comparison.owner_id, cached=True)
         return query, cached
-    result = provider.embed([query])
+    with failed_calls_to(
+        lambda e: record_entry(e, owner_id=comparison.owner_id), "embed_query", provider.embedding_model
+    ):
+        result = provider.embed([query])
     set_cached_embeddings(provider.embedding_model, {query: result.vectors[0]})
-    record_usage(db, result.usage, operation="embed_query", owner_id=comparison.owner_id)
+    record_usage(result.usage, operation="embed_query", owner_id=comparison.owner_id)
     return query, result.vectors[0]
 
 
@@ -116,17 +123,18 @@ def _compare(db: Session, comparison: Comparison) -> None:
     documents = [db.get(Document, uuid.UUID(d)) for d in comparison.document_ids]
     if any(d is None for d in documents):
         raise ValueError("One of the documents no longer exists.")
-    query, embedding = _embed_focus(db, comparison)
+    query, embedding = _embed_focus(comparison)
     material = "\n\n".join(
         _evidence_pack(db, LABELS[i], doc, query, embedding)  # type: ignore[arg-type]
         for i, doc in enumerate(documents)
     )
     provider = get_provider()
-    result = provider.complete_structured(
-        comparison_prompt.build_messages(material, comparison.focus), ComparisonOutput, max_tokens=3000
-    )
+    sink = lambda e: record_entry(e, owner_id=comparison.owner_id)  # noqa: E731
+    with failed_calls_to(sink, "comparison", provider.chat_model, comparison_prompt.VERSION):
+        result = provider.complete_structured(
+            comparison_prompt.build_messages(material, comparison.focus), ComparisonOutput, max_tokens=3000
+        )
     record_usage(
-        db,
         result.usage,
         operation="comparison",
         owner_id=comparison.owner_id,

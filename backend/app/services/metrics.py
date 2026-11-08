@@ -14,6 +14,7 @@ from sqlalchemy import Integer, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.llm.base import Usage
 from app.models import (
     AIUsage,
     ChatMessage,
@@ -26,6 +27,7 @@ from app.models import (
 )
 from app.models.enums import MessageRole, RunStatus
 from app.services.cache import get_aredis
+from app.services.usage import estimate_cost_usd, is_priced
 
 HEARTBEAT_KEY = "worker:heartbeat"
 QUEUES = ("documents", "analysis")
@@ -143,7 +145,8 @@ async def document_metrics(db: AsyncSession, owner_id: uuid.UUID, days: int) -> 
 
 async def ai_usage_metrics(db: AsyncSession, owner_id: uuid.UUID, days: int) -> dict[str, Any]:
     since = _since(days)
-    scope = (AIUsage.owner_id == owner_id, AIUsage.created_at >= since)
+    # Spend figures count real calls only; rows with cached=true are calls a cache avoided.
+    scope = (AIUsage.owner_id == owner_id, AIUsage.created_at >= since, AIUsage.cached.is_(False))
     totals = (
         await db.execute(
             select(
@@ -178,6 +181,29 @@ async def ai_usage_metrics(db: AsyncSession, owner_id: uuid.UUID, days: int) -> 
             .group_by(AIUsage.model)
         )
     ).all()
+    saved_by_model = (
+        await db.execute(
+            select(
+                AIUsage.model,
+                func.count(),
+                func.coalesce(func.sum(AIUsage.prompt_tokens), 0),
+                func.coalesce(func.sum(AIUsage.completion_tokens), 0),
+            )
+            .where(AIUsage.owner_id == owner_id, AIUsage.created_at >= since, AIUsage.cached.is_(True))
+            .group_by(AIUsage.model)
+        )
+    ).all()
+    cache_savings = {
+        "hits": sum(n for _, n, _, _ in saved_by_model),
+        "tokens_saved": sum(int(p) + int(c) for _, _, p, c in saved_by_model),
+        "cost_saved_usd": _num(
+            sum(
+                estimate_cost_usd(Usage(model, prompt_tokens=int(p), completion_tokens=int(c)))
+                for model, _, p, c in saved_by_model
+            ),
+            6,
+        ),
+    }
     day = func.date_trunc("day", AIUsage.created_at)
     daily = (
         await db.execute(
@@ -230,9 +256,12 @@ async def ai_usage_metrics(db: AsyncSession, owner_id: uuid.UUID, days: int) -> 
             for op, n, tokens, cost, avg, p95 in by_operation
         ],
         "by_model": [
-            {"model": m, "calls": n, "tokens": int(tokens or 0), "cost_usd": _num(cost, 6)}
+            {"model": m, "calls": n, "tokens": int(tokens or 0), "cost_usd": _num(cost, 6), "priced": is_priced(m)}
             for m, n, tokens, cost in by_model
         ],
+        # Models used but missing from MODEL_PRICES: their cost above is $0, which is wrong.
+        "unpriced_models": sorted({m for m, *_ in by_model if not is_priced(m)}),
+        "cache_savings": cache_savings,
         "daily": [
             {"date": d.date().isoformat(), "tokens": int(tokens or 0), "cost_usd": _num(cost, 6)}
             for d, tokens, cost in daily

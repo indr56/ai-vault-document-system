@@ -39,7 +39,7 @@ from app.services.insights import generate_insights
 from app.services.jobs import TransientJobError, clear_enqueued, redis_lock
 from app.services.parsing import ParsedDocument, ParseError, parse_document
 from app.services.storage import get_storage
-from app.services.usage import record_usage
+from app.services.usage import failed_calls_to, record_entry, record_usage
 
 logger = get_logger(__name__)
 
@@ -100,6 +100,7 @@ def embed_chunks(db: Session, document: Document, chunks: list[ChunkData]) -> tu
     """Batched embedding with a Redis cache; returns vectors and how many were cache hits."""
     settings = get_settings()
     provider = get_provider()
+    ids = {"owner_id": document.owner_id, "document_id": document.id}
     texts = [c.content for c in chunks]
     cached = cache.get_cached_embeddings(provider.embedding_model, texts)
     missing = [i for i, v in enumerate(cached) if v is None]
@@ -108,7 +109,8 @@ def embed_chunks(db: Session, document: Document, chunks: list[ChunkData]) -> tu
     total_usage = Usage(model=provider.embedding_model)
     for start in range(0, len(missing), settings.embedding_batch_size):
         batch_idx = missing[start : start + settings.embedding_batch_size]
-        result = provider.embed([texts[i] for i in batch_idx])
+        with failed_calls_to(lambda e: record_entry(e, **ids), "embed_document", provider.embedding_model):
+            result = provider.embed([texts[i] for i in batch_idx])
         for i, vector in zip(batch_idx, result.vectors, strict=True):
             vectors[i] = vector
         cache.set_cached_embeddings(provider.embedding_model, {texts[i]: vectors[i] for i in batch_idx})  # type: ignore[misc]
@@ -117,8 +119,15 @@ def embed_chunks(db: Session, document: Document, chunks: list[ChunkData]) -> tu
         total_usage.model = result.usage.model
 
     if missing:
-        record_usage(db, total_usage, operation="embed_document", owner_id=document.owner_id, document_id=document.id)
-    return [v for v in vectors if v is not None], len(chunks) - len(missing)
+        record_usage(total_usage, operation="embed_document", **ids)
+    hits = len(chunks) - len(missing)
+    if hits:  # what the cache saved: the same chunks embedded before (e.g. a reprocess)
+        saved = Usage(
+            provider.embedding_model,
+            prompt_tokens=sum(c.token_count for c in chunks) - sum(chunks[i].token_count for i in missing),
+        )
+        record_usage(saved, operation="embed_document", cached=True, **ids)
+    return [v for v in vectors if v is not None], hits
 
 
 def _store_chunks(db: Session, document: Document, chunks: list[ChunkData], vectors: list[list[float]]) -> None:
