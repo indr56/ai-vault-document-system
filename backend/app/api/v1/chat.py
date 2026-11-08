@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from app.core.errors import AppError
+from app.core.errors import AppError, NotFoundError
 from app.core.logging import get_logger
 from app.core.rate_limit import rate_limited
 from app.db.session import get_async_sessionmaker, get_db
@@ -109,14 +109,21 @@ async def ask_stream(session_id: uuid.UUID, body: AskRequest, db: DB, user: Chat
     # Validate ownership before the stream starts so a 404 is a normal HTTP error.
     await service.get_session(db, user, session_id)
     user_id = user.id
+    # Give the request's connection back to the pool now. FastAPI would only close this session after
+    # the whole stream has been sent, so it would sit idle for the seconds the answer takes while the
+    # stream below holds a second connection.
+    await db.close()
 
     async def events() -> AsyncIterator[dict[str, Any]]:
-        # The stream outlives the request-scoped DB session, so it uses its own.
+        # The stream body runs after this endpoint has returned, so it opens its own session.
         async with get_async_sessionmaker()() as stream_db:
-            stream_user = await stream_db.get(User, user_id)
-            assert stream_user is not None  # validated above
-            session = await service.get_session(stream_db, stream_user, session_id)
             try:
+                # Inside the try: if the chat was deleted between the check above and now, the client
+                # gets an `error` event instead of an empty 200 response.
+                stream_user = await stream_db.get(User, user_id)
+                if stream_user is None:
+                    raise NotFoundError("User not found.", code="user_not_found")
+                session = await service.get_session(stream_db, stream_user, session_id)
                 async for event, data in service.ask_stream(
                     stream_db, stream_user, session, body.question, body.use_cache
                 ):

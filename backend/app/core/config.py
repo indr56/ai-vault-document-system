@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     embedding_batch_size: int = 96
     insights_max_input_tokens: int = 60_000
     processing_max_retries: int = 3
+    # Background job time limits (seconds). The soft limit raises inside the job so it can fail the
+    # document cleanly ("processing_timeout"); the hard limit kills the worker process as a last
+    # resort. Both stay below the 15-minute document lock, so a lock never expires under a live job.
+    job_soft_time_limit_seconds: int = 600
+    job_hard_time_limit_seconds: int = 720
 
     # --- Retrieval / chat ---
     retrieval_top_k: int = 6

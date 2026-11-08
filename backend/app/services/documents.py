@@ -15,6 +15,7 @@ from app.core.errors import (
     NotFoundError,
     NotReadyError,
     PayloadTooLargeError,
+    QueueUnavailableError,
     UnsupportedMediaError,
     ValidationFailedError,
 )
@@ -185,7 +186,7 @@ def enqueue_processing(document_id: uuid.UUID) -> None:
     """Hand the document to a worker. If the broker is briefly unavailable the document stays
     `queued` and the periodic `requeue_stale_documents` task picks it up later."""
     try:
-        tasks.process_document.delay(str(document_id))
+        tasks.enqueue_document(document_id)
     except Exception:
         logger.exception("enqueue_failed", document_id=str(document_id))
 
@@ -285,16 +286,29 @@ async def regenerate_insights(db: AsyncSession, user: User, document_id: uuid.UU
     document = await get_document(db, user, document_id)
     if document.status != DocumentStatus.READY:
         raise NotReadyError("Insights can be regenerated once the document is ready.")
+    previous_status = document.insights_status
     document.insights_status = InsightsStatus.PENDING
     await db.commit()
+    try:
+        await asyncio.to_thread(tasks.enqueue_insights, document.id)
+    except Exception as exc:
+        logger.exception("enqueue_failed", document_id=str(document.id), job="regenerate_insights")
+        document.insights_status = previous_status  # nothing will run, so don't show "pending" forever
+        await db.commit()
+        raise QueueUnavailableError("The job queue is unavailable right now. Please try again shortly.") from exc
     await db.refresh(document)
-    await asyncio.to_thread(tasks.regenerate_insights.delay, str(document.id))
     return document
 
 
 async def delete_document(db: AsyncSession, user: User, document_id: uuid.UUID) -> None:
     """Deletes one version. If it was the latest, the previous version becomes the latest."""
     document = await get_document(db, user, document_id)
+    if document.status == DocumentStatus.PROCESSING:
+        # The worker is writing chunks for this row right now; deleting under it would make its next
+        # write fail. Processing takes seconds to a few minutes, so ask the caller to retry.
+        raise ConflictError(
+            "The document is being processed. Delete it once processing finishes.", code="document_processing"
+        )
     storage_key, was_latest, group_id = document.storage_path, document.is_latest, document.version_group_id
     await db.delete(document)
     await db.flush()

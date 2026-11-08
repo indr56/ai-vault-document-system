@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+import anyio
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -135,7 +136,12 @@ def _is_relevant(chunk: RetrievedChunk, threshold: float) -> bool:
 
 
 async def prepare_question(
-    db: AsyncSession, user: User, session: ChatSession, question: str, use_cache: bool = True
+    db: AsyncSession,
+    user: User,
+    session: ChatSession,
+    question: str,
+    use_cache: bool = True,
+    usages: list[tuple[str, Usage, str | None]] | None = None,
 ) -> PreparedQuestion:
     settings = get_settings()
     provider = get_provider()
@@ -152,6 +158,8 @@ async def prepare_question(
     prepared = PreparedQuestion(
         question=question, standalone_question=question, documents=ready, history=_history_messages(previous)
     )
+    if usages is not None:
+        prepared.usages = usages  # the caller's list, so it still sees the calls made if a later step fails
 
     if prepared.history:
         rewrite = await provider.acomplete(
@@ -366,12 +374,115 @@ def _restore_cached_chunks(prepared: PreparedQuestion) -> None:
     ]
 
 
+# --------------------------------------------------------------------------- interrupted answers
+INTERRUPTED_NOTE = "(The answer was interrupted.)"
+FAILED_TEXT = "The answer could not be generated. Please ask again."
+
+
+@dataclass
+class _Attempt:
+    """What an answer attempt has done so far; kept outside prepare_question so a failure at any
+    step (or the user closing the tab mid-stream) can still record the calls already paid for."""
+
+    user_id: uuid.UUID
+    session_id: uuid.UUID
+    question: str
+    usages: list[tuple[str, Usage, str | None]] = field(default_factory=list)
+    standalone_question: str | None = None
+    answer_messages: list[Message] | None = None  # set when the answer call starts
+    answer_parts: list[str] = field(default_factory=list)
+    answer_usage: Usage | None = None  # set when the provider reports final usage
+    saved: bool = False
+
+
+async def _save_interrupted(attempt: _Attempt, reason: str) -> None:
+    """Persist a failed or interrupted answer: the question, whatever part of the answer was
+    produced, and every AI call made (the interrupted answer call as success=false, its tokens
+    estimated locally because the provider only reports usage at the end of a stream).
+
+    Uses its own DB session: the request's session may be mid-transaction or already closed."""
+    if attempt.saved or (not attempt.usages and attempt.answer_messages is None):
+        return  # nothing was spent and no answer started (e.g. no document is ready): nothing to keep
+    from app.db.session import get_async_sessionmaker
+    from app.services.chunking import count_tokens
+
+    async with get_async_sessionmaker()() as db:
+        if await db.get(ChatSession, attempt.session_id) is None:
+            return  # the chat itself was deleted meanwhile
+        partial = "".join(attempt.answer_parts).strip()
+        db.add(ChatMessage(session_id=attempt.session_id, role=MessageRole.USER, content=attempt.question))
+        await db.flush()
+        db.add(
+            ChatMessage(
+                session_id=attempt.session_id,
+                role=MessageRole.ASSISTANT,
+                content=f"{partial}\n\n{INTERRUPTED_NOTE}" if partial else FAILED_TEXT,
+                standalone_question=attempt.standalone_question,
+                citations=[],
+                follow_up_questions=[],
+                retrieval={"interrupted": True, "reason": reason},
+                grounded=False,
+                abstained=False,
+                from_cache=False,
+            )
+        )
+        for operation, usage, prompt_version in attempt.usages:
+            await arecord_usage(
+                db,
+                usage,
+                operation=operation,
+                owner_id=attempt.user_id,
+                session_id=attempt.session_id,
+                prompt_version=prompt_version,
+            )
+        if attempt.answer_messages is not None and attempt.answer_usage is None:
+            estimate = Usage(
+                model=get_provider().chat_model,
+                prompt_tokens=sum(count_tokens(str(m["content"])) for m in attempt.answer_messages),
+                completion_tokens=count_tokens(partial),
+            )
+            await arecord_usage(
+                db,
+                estimate,
+                operation="chat_answer",
+                owner_id=attempt.user_id,
+                session_id=attempt.session_id,
+                prompt_version=chat_prompt.VERSION,
+                success=False,
+            )
+        await db.commit()
+    attempt.saved = True
+    logger.warning("chat_answer_interrupted", session_id=str(attempt.session_id), reason=reason)
+
+
+async def _save_interrupted_shielded(attempt: _Attempt, reason: str) -> None:
+    # Shielded: when the client disconnects the stream is cancelled, and without the shield this
+    # save would be cancelled at its first await.
+    with anyio.CancelScope(shield=True):
+        try:
+            await _save_interrupted(attempt, reason)
+        except Exception:
+            logger.exception("chat_interrupted_save_failed", session_id=str(attempt.session_id))
+
+
 # --------------------------------------------------------------------------- ask (blocking)
 async def ask(
     db: AsyncSession, user: User, session: ChatSession, question: str, use_cache: bool = True
 ) -> tuple[ChatMessage, ChatMessage]:
+    attempt = _Attempt(user_id=user.id, session_id=session.id, question=question.strip())
+    try:
+        return await _ask(db, user, session, question, use_cache, attempt)
+    except BaseException as exc:  # includes cancellation
+        await _save_interrupted_shielded(attempt, type(exc).__name__)
+        raise
+
+
+async def _ask(
+    db: AsyncSession, user: User, session: ChatSession, question: str, use_cache: bool, attempt: _Attempt
+) -> tuple[ChatMessage, ChatMessage]:
     started = time.perf_counter()
-    prepared = await prepare_question(db, user, session, question, use_cache)
+    prepared = await prepare_question(db, user, session, question, use_cache, usages=attempt.usages)
+    attempt.standalone_question = prepared.standalone_question
 
     if prepared.cached is not None:
         _restore_cached_chunks(prepared)
@@ -393,10 +504,12 @@ async def ask(
         answer = _abstain_text()
     else:
         provider = get_provider()
-        completion = await provider.acomplete(
-            chat_prompt.build_messages(question, prepared.standalone_question, prepared.sources, prepared.history)
+        attempt.answer_messages = chat_prompt.build_messages(
+            question, prepared.standalone_question, prepared.sources, prepared.history
         )
+        completion = await provider.acomplete(attempt.answer_messages)
         answer, answer_usage = completion.text.strip(), completion.usage
+        attempt.answer_usage = answer_usage
         prepared.usages.append(("chat_answer", completion.usage, chat_prompt.VERSION))
 
     citations = extract_citations(answer, prepared)
@@ -421,10 +534,26 @@ async def ask(
 async def ask_stream(
     db: AsyncSession, user: User, session: ChatSession, question: str, use_cache: bool = True
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-    """Yields (event, data) pairs: `status`, `sources`, many `token`, then `done` (or `error`)."""
+    """Yields (event, data) pairs: `status`, many `token`, then `done`.
+
+    If anything fails, or the client disconnects mid-answer, the question, the partial answer and the
+    AI calls already made are still saved (see _save_interrupted); the error itself propagates."""
+    attempt = _Attempt(user_id=user.id, session_id=session.id, question=question.strip())
+    try:
+        async for item in _ask_stream(db, user, session, question, use_cache, attempt):
+            yield item
+    finally:
+        if not attempt.saved:
+            await _save_interrupted_shielded(attempt, "stream_interrupted")
+
+
+async def _ask_stream(
+    db: AsyncSession, user: User, session: ChatSession, question: str, use_cache: bool, attempt: _Attempt
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     started = time.perf_counter()
     yield "status", {"stage": "retrieving"}
-    prepared = await prepare_question(db, user, session, question, use_cache)
+    prepared = await prepare_question(db, user, session, question, use_cache, usages=attempt.usages)
+    attempt.standalone_question = prepared.standalone_question
     yield "status", {"stage": "generating", "standalone_question": prepared.standalone_question}
 
     answer_usage: Usage | None = None
@@ -439,16 +568,16 @@ async def ask_stream(
         yield "token", {"text": answer}
     else:
         provider = get_provider()
-        parts: list[str] = []
-        async for event in provider.astream(
-            chat_prompt.build_messages(question, prepared.standalone_question, prepared.sources, prepared.history)
-        ):
+        attempt.answer_messages = chat_prompt.build_messages(
+            question, prepared.standalone_question, prepared.sources, prepared.history
+        )
+        async for event in provider.astream(attempt.answer_messages):
             if event.delta:
-                parts.append(event.delta)
+                attempt.answer_parts.append(event.delta)
                 yield "token", {"text": event.delta}
             if event.usage:
-                answer_usage = event.usage
-        answer = "".join(parts).strip()
+                answer_usage = attempt.answer_usage = event.usage
+        answer = "".join(attempt.answer_parts).strip()
         if answer_usage:
             prepared.usages.append(("chat_answer", answer_usage, chat_prompt.VERSION))
 
@@ -472,4 +601,5 @@ async def ask_stream(
         from_cache=from_cache,
         started=started,
     )
+    attempt.saved = True
     yield "done", {"question": user_message, "answer": assistant}

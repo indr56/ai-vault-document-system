@@ -76,6 +76,13 @@ class AIServiceError(AppError):
     code = "ai_service_unavailable"
 
 
+class QueueUnavailableError(AppError):
+    """The background-job broker could not accept the job; nothing was started."""
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    code = "queue_unavailable"
+
+
 def _envelope(request: Request, code: str, message: str, details: Any = None) -> dict[str, Any]:
     return {
         "error": {

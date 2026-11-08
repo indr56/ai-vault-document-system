@@ -339,6 +339,8 @@ function DocumentDetail({
           )}
           <button
             className="btn danger sm"
+            disabled={doc.status === "processing"}
+            title={doc.status === "processing" ? "Available once processing finishes" : undefined}
             onClick={() =>
               confirm(`Delete "${doc.title}" (v${doc.version})?`) &&
               action(async () => {

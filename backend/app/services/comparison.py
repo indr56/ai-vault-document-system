@@ -7,6 +7,7 @@ The model then returns a structured, page-referenced comparison.
 
 import uuid
 
+from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy.orm import Session
 
 from app.core.logging import get_logger
@@ -19,6 +20,7 @@ from app.models import Comparison, Document, DocumentInsight
 from app.models.enums import ComparisonStatus
 from app.services import events
 from app.services.cache import get_cached_embeddings, set_cached_embeddings
+from app.services.jobs import TransientJobError, clear_enqueued, redis_lock
 from app.services.retrieval import hybrid_search_sync
 from app.services.usage import record_usage
 
@@ -68,45 +70,68 @@ def _evidence_pack(db: Session, label: str, document: Document, query: str, embe
     return "\n".join(parts)
 
 
-def run_comparison_job(comparison_id: uuid.UUID) -> str:
-    with sync_session() as db:
-        comparison = db.get(Comparison, comparison_id)
-        if comparison is None:
-            return "skipped"
-        comparison.status = ComparisonStatus.RUNNING
-        db.commit()
-        try:
-            documents = [db.get(Document, uuid.UUID(d)) for d in comparison.document_ids]
-            if any(d is None for d in documents):
-                raise ValueError("One of the documents no longer exists.")
-            query, embedding = _embed_focus(db, comparison)
-            material = "\n\n".join(
-                _evidence_pack(db, LABELS[i], doc, query, embedding)  # type: ignore[arg-type]
-                for i, doc in enumerate(documents)
-            )
-            provider = get_provider()
-            result = provider.complete_structured(
-                comparison_prompt.build_messages(material, comparison.focus), ComparisonOutput, max_tokens=3000
-            )
-            record_usage(
-                db,
-                result.usage,
-                operation="comparison",
-                owner_id=comparison.owner_id,
-                prompt_version=comparison_prompt.VERSION,
-            )
-            label_map = {LABELS[i]: {"document_id": str(d.id), "title": d.title} for i, d in enumerate(documents)}  # type: ignore[union-attr]
-            comparison.result = {"labels": label_map, **result.value.model_dump()}
-            comparison.model = result.usage.model
-            comparison.status = ComparisonStatus.COMPLETED
-        except Exception as exc:
-            logger.exception("comparison_failed", comparison_id=str(comparison_id))
-            db.rollback()
-            comparison.status = ComparisonStatus.FAILED
-            comparison.error_message = (
-                str(exc)[:1000] if isinstance(exc, ValueError) else "The comparison failed. Please retry."
-            )
-        comparison.completed_at = utcnow()
-        db.commit()
-        events.publish(comparison.owner_id, f"comparison.{comparison.status}", {"comparison_id": comparison.id})
-        return str(comparison.status)
+COMPARISON_LOCK_TTL_SECONDS = 15 * 60
+
+
+def run_comparison_job(comparison_id: uuid.UUID, *, is_final_attempt: bool = True) -> str:
+    """Runs one comparison. Always ends completed or failed, except for a transient provider error
+    with retries left: then the row goes back to pending and TransientJobError asks Celery to retry."""
+    from app.llm.openai_provider import TRANSIENT_ERRORS
+
+    clear_enqueued("comparison", comparison_id)
+    with redis_lock(f"lock:comparison:{comparison_id}", COMPARISON_LOCK_TTL_SECONDS) as acquired:
+        if not acquired:
+            return "skipped_locked"
+        with sync_session() as db:
+            comparison = db.get(Comparison, comparison_id)
+            if comparison is None or comparison.status in (ComparisonStatus.COMPLETED, ComparisonStatus.FAILED):
+                return "skipped"
+            comparison.status = ComparisonStatus.RUNNING
+            db.commit()
+            try:
+                _compare(db, comparison)
+                comparison.status = ComparisonStatus.COMPLETED
+            except Exception as exc:
+                db.rollback()
+                if isinstance(exc, TRANSIENT_ERRORS) and not is_final_attempt:
+                    logger.warning("comparison_transient_error", comparison_id=str(comparison_id), error=str(exc))
+                    comparison.status = ComparisonStatus.PENDING
+                    db.commit()
+                    raise TransientJobError(str(exc)) from exc
+                logger.exception("comparison_failed", comparison_id=str(comparison_id))
+                comparison.status = ComparisonStatus.FAILED
+                if isinstance(exc, ValueError):
+                    comparison.error_message = str(exc)[:1000]
+                elif isinstance(exc, SoftTimeLimitExceeded):
+                    comparison.error_message = "The comparison took too long and was stopped. Please retry."
+                else:
+                    comparison.error_message = "The comparison failed. Please retry."
+            comparison.completed_at = utcnow()
+            db.commit()
+            events.publish(comparison.owner_id, f"comparison.{comparison.status}", {"comparison_id": comparison.id})
+            return str(comparison.status)
+
+
+def _compare(db: Session, comparison: Comparison) -> None:
+    documents = [db.get(Document, uuid.UUID(d)) for d in comparison.document_ids]
+    if any(d is None for d in documents):
+        raise ValueError("One of the documents no longer exists.")
+    query, embedding = _embed_focus(db, comparison)
+    material = "\n\n".join(
+        _evidence_pack(db, LABELS[i], doc, query, embedding)  # type: ignore[arg-type]
+        for i, doc in enumerate(documents)
+    )
+    provider = get_provider()
+    result = provider.complete_structured(
+        comparison_prompt.build_messages(material, comparison.focus), ComparisonOutput, max_tokens=3000
+    )
+    record_usage(
+        db,
+        result.usage,
+        operation="comparison",
+        owner_id=comparison.owner_id,
+        prompt_version=comparison_prompt.VERSION,
+    )
+    label_map = {LABELS[i]: {"document_id": str(d.id), "title": d.title} for i, d in enumerate(documents)}  # type: ignore[union-attr]
+    comparison.result = {"labels": label_map, **result.value.model_dump()}
+    comparison.model = result.usage.model

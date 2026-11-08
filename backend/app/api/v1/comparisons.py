@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import NotFoundError, NotReadyError
+from app.core.errors import NotFoundError, NotReadyError, QueueUnavailableError
+from app.core.logging import get_logger
 from app.core.rate_limit import rate_limited
 from app.db.session import get_db
 from app.models import Comparison, User
@@ -15,6 +16,7 @@ from app.schemas.chat import ComparisonCreate, ComparisonOut
 from app.services.documents import get_ready_documents
 from app.workers import tasks
 
+logger = get_logger(__name__)
 router = APIRouter(prefix="/comparisons", tags=["comparisons"])
 
 DB = Annotated[AsyncSession, Depends(get_db)]
@@ -40,7 +42,13 @@ async def create_comparison(body: ComparisonCreate, db: DB, user: ChatUser) -> C
     db.add(comparison)
     await db.commit()
     await db.refresh(comparison)
-    await asyncio.to_thread(tasks.run_comparison.delay, str(comparison.id))
+    try:
+        await asyncio.to_thread(tasks.enqueue_comparison, comparison.id)
+    except Exception as exc:
+        logger.exception("enqueue_failed", comparison_id=str(comparison.id))
+        await db.delete(comparison)  # nothing will run it; don't leave a row "pending" forever
+        await db.commit()
+        raise QueueUnavailableError("The job queue is unavailable right now. Please try again shortly.") from exc
     return ComparisonOut.model_validate(comparison)
 
 
