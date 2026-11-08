@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 type Note = { id: number; kind: "info" | "error"; text: string };
 let noteSeq = 0;
 import { Empty, ErrorNote, InsightsBadge, StatusBadge } from "../components/ui";
-import { api, formatBytes, post, timeAgo } from "../lib/api";
+import { api, fileTypesLabel, formatBytes, post, timeAgo, useUploadConfig } from "../lib/api";
 import type { DocumentItem, Insights, ProcessingRun, SummaryResult, UploadResult, VaultEvent } from "../lib/types";
 
 interface Props {
@@ -14,6 +14,7 @@ interface Props {
 }
 
 export default function DocumentsPage({ documents, refresh, onChat, lastEvent }: Props) {
+  const uploadRules = useUploadConfig();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [notes, setNotes] = useState<Note[]>([]);
   const [extraDoc, setExtraDoc] = useState<DocumentItem | null>(null); // an older version opened from Versions
@@ -118,7 +119,10 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
       <div className="page-head">
         <div>
           <h1>Documents</h1>
-          <p>Upload PDF, DOCX, TXT or Markdown. Processing runs in the background; status updates live.</p>
+          <p>
+            Upload {uploadRules ? fileTypesLabel(uploadRules) : "documents"}. Processing runs in the background; status
+            updates live.
+          </p>
         </div>
         <div className="row">
           <input className="input" placeholder="Search title…" value={filter} onChange={(e) => setFilter(e.target.value)} />
@@ -217,6 +221,7 @@ export default function DocumentsPage({ documents, refresh, onChat, lastEvent }:
 }
 
 function DropZone({ onFiles, busy }: { onFiles: (files: File[]) => void; busy: boolean }) {
+  const uploadRules = useUploadConfig();
   const [over, setOver] = useState(false);
   const input = useRef<HTMLInputElement>(null);
   return (
@@ -235,7 +240,7 @@ function DropZone({ onFiles, busy }: { onFiles: (files: File[]) => void; busy: b
         type="file"
         multiple
         hidden
-        accept=".pdf,.docx,.txt,.md"
+        accept={uploadRules?.allowed_extensions.join(",")}
         onChange={(e) => {
           onFiles(Array.from(e.target.files ?? []));
           e.target.value = "";
@@ -247,7 +252,8 @@ function DropZone({ onFiles, busy }: { onFiles: (files: File[]) => void; busy: b
         </span>
       ) : (
         <span>
-          <strong>Choose files</strong> or drag them here · PDF, DOCX, TXT, MD · up to 25 MB each
+          <strong>Choose files</strong> or drag them here
+          {uploadRules && ` · ${fileTypesLabel(uploadRules)} · up to ${uploadRules.max_upload_mb} MB each`}
         </span>
       )}
     </div>
@@ -277,6 +283,7 @@ function DocumentDetail({
 }) {
   const [tab, setTab] = useState<Tab>("insights");
   const [error, setError] = useState<unknown>(null);
+  const uploadRules = useUploadConfig();
   const versionInput = useRef<HTMLInputElement>(null);
 
   const action = async (fn: () => Promise<unknown>) => {
@@ -331,7 +338,7 @@ function DocumentDetail({
             ref={versionInput}
             type="file"
             hidden
-            accept=".pdf,.docx,.txt,.md"
+            accept={uploadRules?.allowed_extensions.join(",")}
             onChange={(e) => e.target.files?.[0] && onNewVersion(e.target.files[0])}
           />
           {(doc.status === "failed" || doc.status === "ready") && (

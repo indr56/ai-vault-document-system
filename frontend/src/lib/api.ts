@@ -1,4 +1,5 @@
 // Small typed client for the Vault API. All requests carry the X-API-Key header.
+import { useEffect, useState } from "react";
 
 const KEY_STORAGE = "vault.apiKey";
 export const API = "/api/v1";
@@ -104,3 +105,26 @@ export function timeAgo(iso: string): string {
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return new Date(iso).toLocaleDateString();
 }
+
+/** Upload rules come from the API (GET /config), so a new file type or size limit is a backend-only change. */
+export interface UploadConfig {
+  allowed_extensions: string[];
+  max_upload_mb: number;
+  max_batch_files: number;
+}
+
+let uploadConfig: Promise<UploadConfig> | null = null;
+
+export function useUploadConfig(): UploadConfig | null {
+  const [config, setConfig] = useState<UploadConfig | null>(null);
+  useEffect(() => {
+    uploadConfig ??= api<{ upload: UploadConfig }>("/config").then((c) => c.upload);
+    uploadConfig.then(setConfig, () => {
+      uploadConfig = null; // retry on the next mount
+    });
+  }, []);
+  return config;
+}
+
+/** ".pdf,.docx" -> "PDF, DOCX" */
+export const fileTypesLabel = (c: UploadConfig) => c.allowed_extensions.map((e) => e.slice(1).toUpperCase()).join(", ");

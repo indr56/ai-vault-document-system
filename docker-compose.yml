@@ -61,7 +61,8 @@ services:
         condition: service_healthy
 
   db:
-    image: pgvector/pgvector:pg16
+    # Pinned: retrieval uses hnsw.iterative_scan, which needs pgvector 0.8+.
+    image: pgvector/pgvector:0.8.7-pg16
     environment:
       POSTGRES_USER: vault
       POSTGRES_PASSWORD: vault

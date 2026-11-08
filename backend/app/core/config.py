@@ -69,7 +69,10 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 120
     upload_rate_limit_per_minute: int = 20
     chat_rate_limit_per_minute: int = 30
-    max_documents_per_user: int = 1000
+    # Abuse guard, not a scale limit: the design (indexes, HNSW, per-owner filters) targets thousands of
+    # documents per user; raise it freely.
+    max_documents_per_user: int = 10_000
+    max_batch_files: int = 20
     daily_token_quota: int = 2_000_000
 
     # --- Metrics ---

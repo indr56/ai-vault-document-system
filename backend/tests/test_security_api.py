@@ -126,3 +126,23 @@ def test_websocket_relays_events_with_ticket() -> None:
         with pytest.raises(WebSocketDisconnect) as refused, http.websocket_connect(f"/api/v1/events?ticket={ticket}"):
             pass
         assert refused.value.code == 1008  # the used ticket is refused
+
+
+# ------------------------------------------------------------------ client config (#12, #20)
+async def test_config_exposes_upload_rules(client: httpx.AsyncClient) -> None:
+    from app.core.config import get_settings
+
+    upload = (await client.get("/config")).json()["upload"]
+    settings = get_settings()
+    assert upload["allowed_extensions"] == list(settings.allowed_extensions)  # the UI's file picker uses this
+    assert upload["max_upload_mb"] == settings.max_upload_mb
+    assert upload["max_documents_per_user"] == 10_000  # was 1,000
+
+
+async def test_batch_limit_comes_from_settings(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "max_batch_files", 1)
+    files = [("files", ("a.txt", b"a" * 40)), ("files", ("b.txt", b"b" * 40))]
+    response = await client.post("/documents/batch", files=files)
+    assert response.status_code == 422 and response.json()["error"]["code"] == "too_many_files"

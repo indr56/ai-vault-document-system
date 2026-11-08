@@ -28,7 +28,6 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 DB = Annotated[AsyncSession, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(rate_limited("default"))]
 UploadUser = Annotated[User, Depends(rate_limited("upload"))]
-MAX_BATCH_FILES = 20
 
 
 async def _read_limited(file: UploadFile) -> bytes:
@@ -92,8 +91,9 @@ async def upload_document(
     description="Each file is validated independently: valid files are queued even if others fail.",
 )
 async def upload_batch(db: DB, user: UploadUser, files: list[UploadFile] = File(...)) -> BatchUploadResult:
-    if len(files) > MAX_BATCH_FILES:
-        raise ValidationFailedError(f"At most {MAX_BATCH_FILES} files per batch.", code="too_many_files")
+    max_files = get_settings().max_batch_files
+    if len(files) > max_files:
+        raise ValidationFailedError(f"At most {max_files} files per batch.", code="too_many_files")
     results: list[UploadResult] = []
     errors: list[dict[str, str]] = []
     for file in files:
