@@ -23,7 +23,7 @@
 | New file type | `services/parsing.py` (a parser returning a `ParsedDocument`) + `allowed_extensions` in `core/config.py` + `CONTENT_TYPES`/`MAGIC_BYTES` in `services/documents.py` + a test. The UI needs no change: it reads the allowed types from `GET /api/v1/config` |
 | New pipeline step | `services/processing.py` (`recorder.stage(...)`) + `ProcessingStage` enum |
 | New AI feature | prompt file + Pydantic output in `llm/schemas.py` + fake-provider branch in `llm/fake_provider.py` + service + route + test |
-| New endpoint | `api/v1/<area>.py` + schema in `schemas/` + test in `tests/test_api.py` |
+| New endpoint | `api/v1/<area>.py` with a `summary=` (a test fails on FastAPI's generated names) + schema in `schemas/` + test in `tests/test_api.py`. Bodies are capped at 1 MB before parsing (`core/body_limit.py`); an endpoint that takes files needs its own limit there |
 | DB change | edit `models/`, then `alembic revision --autogenerate -m "..."`, review the file, `make test` |
 | Swap or add an LLM vendor | new class implementing `llm/base.py::LLMProvider`, selected in `llm/__init__.py` |
 | Tune retrieval | `services/retrieval.py` and `retrieval_*` / `min_relevance_score` settings, then `make eval` |

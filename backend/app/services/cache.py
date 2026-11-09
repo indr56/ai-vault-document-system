@@ -9,6 +9,7 @@ import array
 import base64
 import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable
 from functools import lru_cache, wraps
 from typing import Any, ParamSpec, TypeVar
@@ -169,13 +170,32 @@ async def aadd_semantic_entry(index_key: str, question: str, embedding: list[flo
     await pipe.execute()
 
 
+_NUMBER = re.compile(r"\d[\d,.]*\d|\d")
+_WORD = re.compile(r"[A-Za-z][\w'-]*")
+
+
+def specifics(question: str) -> frozenset[str]:
+    """The details that make two near-identical questions different questions: numbers (years,
+    amounts, section numbers) and names (capitalised words after the first word).
+
+    "What is the 2025 premium?" and "What is the 2026 premium?" embed far above the threshold but
+    have different answers; so do "...for Acme?" and "...for Northwind?"."""
+    numbers = {n.replace(",", "") for n in _NUMBER.findall(question)}
+    names = {w.lower() for w in _WORD.findall(question)[1:] if w[0].isupper()}
+    return frozenset(numbers | names)
+
+
 @afail_open(default=None)
-async def afind_semantic(index_key: str, embedding: list[float]) -> tuple[str, str, float] | None:
-    """Returns (answer_key, matched_question, similarity) for the closest entry above the threshold."""
+async def afind_semantic(index_key: str, question: str, embedding: list[float]) -> tuple[str, str, float] | None:
+    """Returns (answer_key, matched_question, similarity) for the closest entry above the threshold
+    that asks about the same specifics (numbers and names) as `question`."""
     threshold = get_settings().semantic_cache_threshold
+    wanted = specifics(question)
     best: tuple[str, str, float] | None = None
     for raw in await get_aredis().lrange(index_key, 0, -1):
         entry = json.loads(raw)
+        if specifics(entry["q"]) != wanted:
+            continue
         similarity = cosine(embedding, unpack_vector(base64.b64decode(entry["e"])))
         if similarity >= threshold and (best is None or similarity > best[2]):
             best = (entry["key"], entry["q"], similarity)

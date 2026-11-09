@@ -3,6 +3,7 @@ entities, sentiment and suggested questions. Long documents use map-reduce."""
 
 import hashlib
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy.orm import Session
 
@@ -82,6 +83,23 @@ def _section_notes(document: Document, section: str) -> str:
     return result.value.notes
 
 
+def _notes_for(document: Document, sections: list[str]) -> list[str]:
+    """Map calls run in parallel (they are independent), in the original order. ~1,000 pages are
+    ~80 sections: one after another at ~10 s each that is over 13 minutes, past the job's time
+    limit; 8 at a time it is under 2 minutes."""
+    if len(sections) == 1:
+        return [_section_notes(document, sections[0])]
+    pool = ThreadPoolExecutor(max_workers=min(get_settings().insights_map_concurrency, len(sections)))
+    try:
+        return list(pool.map(lambda section: _section_notes(document, section), sections))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)  # on a timeout, don't start the remaining calls
+
+
+def needs_condensing(parsed: ParsedDocument) -> bool:
+    return count_tokens(parsed.text_with_page_markers) > get_settings().insights_max_input_tokens
+
+
 def prepare_analysis_text(document: Document, parsed: ParsedDocument) -> str:
     """Full text when it fits the budget; otherwise map-reduce:
 
@@ -94,10 +112,10 @@ def prepare_analysis_text(document: Document, parsed: ParsedDocument) -> str:
     if count_tokens(text) <= budget:
         return text
 
-    notes = [_section_notes(document, section) for section in _split_sections(parsed, SECTION_TOKENS)]
+    notes = _notes_for(document, _split_sections(parsed, SECTION_TOKENS))
     levels = 1
     while count_tokens("\n\n".join(notes)) > budget and levels < MAX_REDUCE_LEVELS:
-        notes = [_section_notes(document, group) for group in _group(notes, SECTION_TOKENS)]
+        notes = _notes_for(document, _group(notes, SECTION_TOKENS))
         levels += 1
     joined = "\n\n".join(notes)
     if count_tokens(joined) > budget:  # pragma: no cover - would need tens of thousands of pages
@@ -133,6 +151,7 @@ def generate_insights(db: Session, document: Document, parsed: ParsedDocument) -
         "sentiment": out.sentiment.model_dump(),
         "suggested_questions": out.suggested_questions[:5],
         "language": out.language[:20],
+        "analysis_text": text if needs_condensing(parsed) else None,
         "model": result.usage.model,
         "prompt_version": insights_prompt.VERSION,
     }

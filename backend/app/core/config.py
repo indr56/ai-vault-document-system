@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     chunk_overlap_tokens: int = 100
     embedding_batch_size: int = 96
     insights_max_input_tokens: int = 60_000
+    insights_map_concurrency: int = 8  # parallel map calls for long documents
     processing_max_retries: int = 3
     # Background job time limits (seconds). The soft limit raises inside the job so it can fail the
     # document cleanly ("processing_timeout"); the hard limit kills the worker process as a last
@@ -65,7 +66,7 @@ class Settings(BaseSettings):
     semantic_cache_max_entries: int = 200
     embedding_cache_ttl_seconds: int = 7 * 24 * 3600
 
-    # --- Limits & quotas (per API key) ---
+    # --- Limits & quotas (per user, across all of that user's API keys) ---
     rate_limit_per_minute: int = 120
     upload_rate_limit_per_minute: int = 20
     chat_rate_limit_per_minute: int = 30

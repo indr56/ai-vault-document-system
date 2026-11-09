@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from app.core.errors import AppError, NotFoundError
+from app.core.errors import AppError, NotFoundError, error_responses
 from app.core.logging import get_logger
 from app.core.rate_limit import rate_limited
 from app.db.session import get_async_sessionmaker, get_db
@@ -51,6 +51,7 @@ def _message_out(message: ChatMessage) -> MessageOut:
 
 @router.post(
     "/sessions",
+    responses=error_responses(404),
     response_model=SessionOut,
     status_code=status.HTTP_201_CREATED,
     summary="Start a conversation about one or more documents",
@@ -60,7 +61,7 @@ async def create_session(body: SessionCreate, db: DB, user: CurrentUser) -> Sess
     return _session_out(session, 0)
 
 
-@router.get("/sessions", response_model=SessionList)
+@router.get("/sessions", response_model=SessionList, summary="List your conversations, most recent first")
 async def list_sessions(
     db: DB,
     user: CurrentUser,
@@ -79,7 +80,9 @@ async def get_history(session_id: uuid.UUID, db: DB, user: CurrentUser) -> ChatH
     return ChatHistory(session=_session_out(session, len(messages)), messages=[_message_out(m) for m in messages])
 
 
-@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete a conversation and its messages"
+)
 async def delete_session(session_id: uuid.UUID, db: DB, user: CurrentUser) -> Response:
     await service.delete_session(db, user, session_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -87,6 +90,7 @@ async def delete_session(session_id: uuid.UUID, db: DB, user: CurrentUser) -> Re
 
 @router.post(
     "/sessions/{session_id}/messages",
+    responses=error_responses(409, 503),
     response_model=AskResponse,
     summary="Ask a question (waits for the full answer)",
     description="Answers only from the session's documents, with [n] citations mapped to document, "
@@ -100,6 +104,7 @@ async def ask(session_id: uuid.UUID, body: AskRequest, db: DB, user: ChatUser) -
 
 @router.post(
     "/sessions/{session_id}/messages/stream",
+    responses=error_responses(409, 503),
     summary="Ask a question and stream the answer (Server-Sent Events)",
     description="Events: `status` → `token` (many) → `done` (the saved question and answer, same shape "
     "as the non-streaming endpoint) or `error`.",

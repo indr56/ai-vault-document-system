@@ -10,6 +10,8 @@ import structlog
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 logger = structlog.get_logger(__name__)
 
@@ -83,6 +85,48 @@ class QueueUnavailableError(AppError):
     code = "queue_unavailable"
 
 
+class ErrorBody(BaseModel):
+    code: str = Field(description="Stable machine-readable code, e.g. document_not_found")
+    message: str = Field(description="Human-readable explanation")
+    details: dict[str, Any] = Field(default_factory=dict)
+    request_id: str | None = Field(default=None, description="Also in the X-Request-ID response header")
+
+
+class ErrorResponse(BaseModel):
+    """Every error the API returns has this shape."""
+
+    error: ErrorBody
+
+
+ERROR_DESCRIPTIONS = {
+    401: "Missing or invalid API key (X-API-Key header).",
+    404: "Not found, or not yours.",
+    409: "Conflicts with the current state, e.g. the document is still processing.",
+    413: "The request body or a file is larger than allowed.",
+    415: "Unsupported file type, or the content doesn't match the extension.",
+    422: "The request failed validation.",
+    429: "Rate limit or daily AI token quota exceeded; see Retry-After.",
+    500: "Unexpected server error.",
+    503: "A dependency is unavailable (the job queue or the AI provider); retry shortly.",
+}
+
+
+def error_responses(*codes: int) -> dict[int | str, dict[str, Any]]:
+    """For a route's `responses=`: documents these error codes in /docs with the shared schema."""
+    return {code: {"model": ErrorResponse, "description": ERROR_DESCRIPTIONS[code]} for code in codes}
+
+
+HTTP_ERROR_CODES = {
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    413: "payload_too_large",
+    415: "unsupported_media_type",
+}
+
+
 def _envelope(request: Request, code: str, message: str, details: Any = None) -> dict[str, Any]:
     return {
         "error": {
@@ -111,6 +155,17 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content=_envelope(request, "validation_failed", "Request validation failed", {"errors": exc.errors()}),
+        )
+
+    # Errors raised by the framework itself (unknown route, wrong method, unreadable body, the body
+    # size limit) get the same envelope as ours, so clients parse one error format.
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        code = HTTP_ERROR_CODES.get(exc.status_code, "http_error")
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=_envelope(request, code, str(exc.detail)),
+            headers=getattr(exc, "headers", None),
         )
 
     @app.exception_handler(Exception)

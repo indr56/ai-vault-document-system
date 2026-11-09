@@ -56,6 +56,10 @@ class FollowUpQuestions(BaseModel):
     questions: list[str]
 
 
+class AnsweredSuggestions(BaseModel):
+    answered: list[int] = Field(description="1-based numbers of the suggestions the answer already covers")
+
+
 class ComparedValue(BaseModel):
     document_label: str = Field(description="The document label, e.g. 'A' or 'B'")
     value: str

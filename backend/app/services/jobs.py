@@ -8,9 +8,11 @@ import random
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import lru_cache
 
 import redis
 
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.services import cache
 
@@ -76,6 +78,39 @@ def clear_enqueued(kind: str, item_id: uuid.UUID | str) -> None:
         cache.get_redis().delete(_marker(kind, item_id))
     except redis.RedisError:
         logger.warning("enqueued_marker_failed", kind=kind, item_id=str(item_id))
+
+
+def document_lock_key(document_id: uuid.UUID | str) -> str:
+    return f"lock:document:{document_id}"
+
+
+def comparison_lock_key(comparison_id: uuid.UUID | str) -> str:
+    return f"lock:comparison:{comparison_id}"
+
+
+def is_locked(key: str) -> bool:
+    """True while a job holds this lock. Fails open (False) if Redis is unreachable."""
+    try:
+        return bool(cache.get_redis().exists(key))
+    except redis.RedisError:
+        return False
+
+
+# Celery queue each kind of job is routed to (see celery_app.task_routes).
+QUEUE_OF = {"document": "documents", "insights": "documents", "comparison": "analysis"}
+
+
+@lru_cache
+def _broker() -> redis.Redis:
+    return redis.Redis.from_url(get_settings().celery_broker_url, socket_timeout=2)
+
+
+def queue_backlog(kind: str) -> int:
+    """Messages waiting in the broker queue for this kind of job (0 if it can't be read)."""
+    try:
+        return int(_broker().llen(QUEUE_OF[kind]))  # type: ignore[arg-type]
+    except redis.RedisError:
+        return 0
 
 
 def waiting_in_queue(kind: str, item_ids: list[uuid.UUID]) -> set[uuid.UUID]:

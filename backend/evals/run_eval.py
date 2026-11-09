@@ -16,6 +16,7 @@ Results are written to evals/results/<timestamp>.json.
 
 import argparse
 import json
+import re
 import statistics
 import sys
 import time
@@ -50,6 +51,9 @@ def ensure_documents(client: httpx.Client, files: dict[str, str]) -> dict[str, s
 def score(case: dict[str, Any], answer: dict[str, Any], ids: dict[str, str]) -> dict[str, Any]:
     text = answer["content"].lower()
     result: dict[str, Any] = {"id": case["id"], "abstained": answer["abstained"], "latency_ms": answer["latency_ms"]}
+    # A [n] in the text that has no citation behind it can't be opened (#80, "not found" answers too).
+    marks = {int(n) for n in re.findall(r"\[(\d{1,2})\]", answer["content"])}
+    result["dangling_marks"] = len(marks - {c["number"] for c in answer["citations"]})
     if case.get("abstain"):
         result["abstention_correct"] = answer["abstained"]
         return result
@@ -109,6 +113,7 @@ def main() -> None:
         "citation_page_acc": rate(results, "citation_page_correct"),
         "abstention_acc": rate(results, "abstention_correct"),
         "false_abstention": rate(results, "false_abstention"),
+        "dangling_citation_marks": sum(r["dangling_marks"] for r in results),
         "follow_up_repeat": (
             round(sum(r.get("follow_up_repeats", 0) for r in results) / total_follow_ups, 3)
             if (total_follow_ups := sum(r.get("follow_ups", 0) for r in results))

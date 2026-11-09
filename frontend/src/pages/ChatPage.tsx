@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Empty, ErrorNote } from "../components/ui";
-import { api, post, postStream, timeAgo } from "../lib/api";
+import { api, listAll, post, postStream, timeAgo } from "../lib/api";
 import type { ChatSession, Citation, DocumentItem, Message, VaultEvent } from "../lib/types";
 
 interface Props {
@@ -17,9 +17,9 @@ export default function ChatPage({ documents, seed, clearSeed, lastEvent }: Prop
   const [error, setError] = useState<unknown>(null);
 
   const loadSessions = useCallback(async () => {
-    const data = await api<{ items: ChatSession[] }>("/chat/sessions?limit=50");
-    setSessions(data.items);
-    return data.items;
+    const items = await listAll<ChatSession>("/chat/sessions", 100); // all of them, newest first
+    setSessions(items);
+    return items;
   }, []);
 
   const createSession = useCallback(
@@ -37,10 +37,29 @@ export default function ChatPage({ documents, seed, clearSeed, lastEvent }: Prop
     [loadSessions],
   );
 
+  // After a chat is deleted (here or in another tab), open the newest remaining one, or the picker.
+  const showAfterDelete = useCallback((items: ChatSession[], deletedId: string) => {
+    setActiveId((current) => (current === deletedId || current === null ? (items[0]?.id ?? null) : current));
+    if (!items.length) setCreating(true);
+  }, []);
+
+  const deleteSession = async (id: string) => {
+    setError(null);
+    try {
+      await api(`/chat/sessions/${id}`, { method: "DELETE" });
+      showAfterDelete(await loadSessions(), id);
+    } catch (e) {
+      setError(e);
+    }
+  };
+
   // Live: chats created, deleted or answered in another tab show up here without a reload.
   useEffect(() => {
-    if (lastEvent?.type.startsWith("chat.")) void loadSessions().catch(setError);
-  }, [lastEvent, loadSessions]);
+    if (!lastEvent?.type.startsWith("chat.")) return;
+    loadSessions().then((items) => {
+      if (lastEvent.type === "chat.session_deleted" && lastEvent.session_id) showAfterDelete(items, lastEvent.session_id);
+    }, setError);
+  }, [lastEvent, loadSessions, showAfterDelete]);
 
   useEffect(() => {
     loadSessions().then((items) => {
@@ -87,7 +106,13 @@ export default function ChatPage({ documents, seed, clearSeed, lastEvent }: Prop
         {creating || !activeId ? (
           <NewChat documents={documents} onCreate={createSession} />
         ) : (
-          <Conversation key={activeId} sessionId={activeId} onChanged={loadSessions} lastEvent={lastEvent} />
+          <Conversation
+            key={activeId}
+            sessionId={activeId}
+            onChanged={loadSessions}
+            onDelete={() => deleteSession(activeId)}
+            lastEvent={lastEvent}
+          />
         )}
       </div>
     </div>
@@ -140,10 +165,12 @@ interface SkippedDocument {
 function Conversation({
   sessionId,
   onChanged,
+  onDelete,
   lastEvent,
 }: {
   sessionId: string;
   onChanged: () => void;
+  onDelete: () => void;
   lastEvent: VaultEvent | null;
 }) {
   const [session, setSession] = useState<ChatSession | null>(null);
@@ -159,6 +186,7 @@ function Conversation({
       api<{ session: ChatSession; messages: Message[] }>(`/chat/sessions/${sessionId}`).then((d) => {
         setSession(d.session);
         setMessages(d.messages);
+        return d.messages;
       }, setError),
     [sessionId],
   );
@@ -172,6 +200,13 @@ function Conversation({
     if (lastEvent?.type === "chat.message_created" && lastEvent.session_id === sessionId && !pending) void loadHistory();
   }, [lastEvent, sessionId, pending, loadHistory]);
 
+  // One of this chat's documents was deleted: refresh its document list (and the empty-chat note).
+  useEffect(() => {
+    if (lastEvent?.type === "document.deleted" && session?.documents.some((d) => d.id === lastEvent.document_id))
+      void loadHistory();
+  }, [lastEvent, session, loadHistory]);
+  const orphaned = session !== null && session.documents.length === 0;
+
   useEffect(() => {
     if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight;
   }, [messages, pending?.answer]);
@@ -182,6 +217,7 @@ function Conversation({
     setInput("");
     setError(null);
     setPending({ question, answer: "", stage: "Searching documents…" });
+    let ended = false; // a "done" or "error" event arrived
     try {
       await postStream(`/chat/sessions/${sessionId}/messages/stream`, { question }, (event, data) => {
         if (event === "status") {
@@ -190,9 +226,11 @@ function Conversation({
         }
         else if (event === "token") setPending((p) => p && { ...p, answer: p.answer + data.text });
         else if (event === "done") {
+          ended = true;
           setMessages((m) => [...m, data.question, data.answer]);
           setPending(null);
         } else if (event === "error") {
+          ended = true;
           setError(new Error(data.message));
           setPending(null);
           void loadHistory(); // the question and any partial answer were saved
@@ -203,6 +241,16 @@ function Conversation({
     } finally {
       setPending(null);
       onChanged();
+      // The stream stopped without "done" or "error" (connection dropped, proxy timeout). Once the
+      // answer has started, the server saves the question and the partial answer: show them. If it
+      // dropped before that, nothing was saved: put the question back so it isn't lost.
+      if (!ended)
+        void loadHistory().then((saved) => {
+          const last = saved?.filter((m) => m.role === "user").at(-1);
+          if (last?.content === question) return;
+          setInput(question);
+          setError(new Error("The connection dropped before the answer started. Your question is back in the box."));
+        });
     }
   };
 
@@ -211,7 +259,17 @@ function Conversation({
   return (
     <div className="card chat-panel">
       <div className="chat-head">
-        <h2>{session?.title ?? "…"}</h2>
+        <div className="spread">
+          <h2>{session?.title ?? "…"}</h2>
+          <button
+            className="btn danger sm"
+            disabled={!!pending}
+            title={pending ? "Available once the answer finishes" : undefined}
+            onClick={() => confirm(`Delete the chat "${session?.title ?? ""}" and its messages?`) && onDelete()}
+          >
+            Delete chat
+          </button>
+        </div>
         <div className="row small muted" style={{ marginTop: 4 }}>
           {session?.documents.map((d) => (
             <span key={d.id} className="badge plain">
@@ -242,13 +300,19 @@ function Conversation({
             </div>
           </>
         )}
-        {!pending && lastAssistant && lastAssistant.follow_up_questions.length > 0 && (
+        {!pending && !orphaned && lastAssistant && lastAssistant.follow_up_questions.length > 0 && (
           <div className="chips">
             {lastAssistant.follow_up_questions.map((q) => (
               <button key={q} className="chip" onClick={() => ask(q)}>
                 {q}
               </button>
             ))}
+          </div>
+        )}
+        {orphaned && (
+          <div className="alert info">
+            The documents in this chat were deleted, so it can't answer new questions. Start a new chat to ask about
+            other documents.
           </div>
         )}
         {skipped.length > 0 && (
@@ -268,7 +332,8 @@ function Conversation({
         <textarea
           className="textarea"
           rows={1}
-          placeholder="Ask a question…  (Enter to send, Shift+Enter for a new line)"
+          placeholder={orphaned ? "This chat's documents were deleted" : "Ask a question…  (Enter to send, Shift+Enter for a new line)"}
+          disabled={orphaned}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
@@ -278,7 +343,7 @@ function Conversation({
             }
           }}
         />
-        <button className="btn primary" type="submit" disabled={!input.trim() || !!pending}>
+        <button className="btn primary" type="submit" disabled={!input.trim() || !!pending || orphaned}>
           Send
         </button>
       </form>

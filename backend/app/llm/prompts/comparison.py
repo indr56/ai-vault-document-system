@@ -1,8 +1,13 @@
-"""Comparative analysis across documents (e.g. two insurance quotes, two policy versions)."""
+"""Comparative analysis across documents (e.g. two insurance quotes, two policy versions).
+
+v3: same instructions; for versions of one document the material now ends with a word-level list
+of the changes between their texts (services.comparison.version_changes), which the model must
+cover. Rows whose values are identical in every document are dropped after the call.
+"""
 
 from app.llm.base import Message
 
-VERSION = "comparison-v2"
+VERSION = "comparison-v3"
 
 SYSTEM = """You compare documents for a professional who must make a decision.
 Use ONLY the provided material. Each document has a label (A, B, ...).

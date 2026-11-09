@@ -27,8 +27,8 @@ from app.llm import get_provider
 from app.llm.prompts import summary as summary_prompt
 from app.models import Document, DocumentInsight, DocumentSummary, ProcessingRun, User
 from app.models.enums import DocumentStatus, InsightsStatus
-from app.services import events
-from app.services.insights import prepare_analysis_text
+from app.services import events, jobs
+from app.services.insights import needs_condensing
 from app.services.parsing import parse_document
 from app.services.storage import get_storage
 from app.services.usage import UsageEntry, arecord_entries, failed_calls_to
@@ -260,11 +260,12 @@ async def upload_document(
             return UploadOutcome(await reprocess_document(db, user, duplicate.id), duplicate=True, reprocessing=True)
         return await _duplicate_outcome(db, duplicate)
 
-    count = (
-        await db.execute(select(func.count()).where(Document.owner_id == user.id, Document.is_latest.is_(True)))
-    ).scalar_one()
-    if count >= get_settings().max_documents_per_user:
-        raise ConflictError("Document limit reached for this account.", code="document_limit_reached")
+    if replaces_document_id is None:  # a new version replaces its document; it doesn't add one
+        count = (
+            await db.execute(select(func.count()).where(Document.owner_id == user.id, Document.is_latest.is_(True)))
+        ).scalar_one()
+        if count >= get_settings().max_documents_per_user:
+            raise ConflictError("Document limit reached for this account.", code="document_limit_reached")
 
     previous = await get_document(db, user, replaces_document_id) if replaces_document_id else None
     previous_group = previous.version_group_id if previous is not None else None
@@ -328,8 +329,15 @@ async def upload_document(
 
 async def reprocess_document(db: AsyncSession, user: User, document_id: uuid.UUID) -> Document:
     document = await get_document(db, user, document_id)
-    if document.status == DocumentStatus.PROCESSING:
-        raise ConflictError("The document is already being processed.", code="already_processing")
+    # The status alone isn't enough: while insights are written the document is already "ready",
+    # but the job still holds its lock, and a second job would find it locked and stop.
+    if document.status == DocumentStatus.PROCESSING or await asyncio.to_thread(
+        jobs.is_locked, jobs.document_lock_key(document.id)
+    ):
+        raise ConflictError(
+            "The document is being processed. Try again once processing finishes.", code="already_processing"
+        )
+    document.attempts = 0  # a manual retry gets the full retry budget again
     document.status = DocumentStatus.QUEUED
     document.stage = None
     document.error_code = None
@@ -386,14 +394,23 @@ async def delete_document(db: AsyncSession, user: User, document_id: uuid.UUID) 
 
 # --------------------------------------------------------------------------- summaries
 def _load_summary_text(document_id: uuid.UUID) -> str:
-    """Runs in a thread: re-parse the stored file; long documents are condensed (map step, whose
-    section notes are cached from when insights were generated, so this is normally fast)."""
+    """Runs in a thread. A document that fits the budget is read whole (a re-parse, no AI call). A
+    longer one uses the condensed notes saved with its insights, so no map calls run in a request."""
     with sync_session() as db:
         document = db.get(Document, document_id)
         assert document is not None
+        condensed = document.insight.analysis_text if document.insight is not None else None
         db.expunge(document)
+    if condensed:
+        return condensed
     parsed = parse_document(get_storage().path(document.storage_path), document.extension)
-    return prepare_analysis_text(document, parsed)
+    if needs_condensing(parsed):
+        raise NotReadyError(
+            "This document is too long to summarise directly; its summary is built from the notes made "
+            "when its insights were generated. Retry insights, then ask again.",
+            code="insights_required",
+        )
+    return parsed.text_with_page_markers
 
 
 async def custom_summary(

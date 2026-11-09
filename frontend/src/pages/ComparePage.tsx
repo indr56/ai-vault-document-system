@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Empty, ErrorNote } from "../components/ui";
-import { api, post, timeAgo } from "../lib/api";
+import { api, listAll, post, timeAgo } from "../lib/api";
 import type { Comparison, DocumentItem, VaultEvent } from "../lib/types";
 
 interface Props {
@@ -13,10 +13,7 @@ export default function ComparePage({ documents, lastEvent, connected }: Props) 
   // Include older versions so "v1 vs v2" comparisons are possible.
   const [ready, setReady] = useState<DocumentItem[]>([]);
   useEffect(() => {
-    api<{ items: DocumentItem[] }>("/documents?status=ready&include_old_versions=true&limit=200").then(
-      (d) => setReady(d.items),
-      setError,
-    );
+    listAll<DocumentItem>("/documents?status=ready&include_old_versions=true").then(setReady, setError);
   }, [documents]);
   const [picked, setPicked] = useState<string[]>([]);
   const [focus, setFocus] = useState("");
@@ -59,9 +56,23 @@ export default function ComparePage({ documents, lastEvent, connected }: Props) 
   };
 
   const active = history.find((c) => c.id === activeId) ?? null;
-  const titleOf = (id: string) => {
+  // "v1" is shown too when it isn't the latest, so "lease v2 vs lease v1" can be told apart.
+  const titleOf = (c: Comparison, id: string) => {
     const d = ready.find((x) => x.id === id);
-    return d ? `${d.title}${d.version > 1 ? ` v${d.version}` : ""}` : id.slice(0, 8);
+    if (d) return `${d.title}${d.version > 1 || !d.is_latest ? ` v${d.version}` : ""}`;
+    // Deleted since: the result keeps the title it was compared under.
+    const label = Object.values(c.result?.labels ?? {}).find((l) => l.document_id === id);
+    return label ? `${label.title}${label.version ? ` v${label.version}` : ""} (deleted)` : "a deleted document";
+  };
+  const remove = async (c: Comparison) => {
+    if (!confirm("Delete this comparison?")) return;
+    try {
+      await api(`/comparisons/${c.id}`, { method: "DELETE" });
+      if (activeId === c.id) setActiveId(null);
+      await load();
+    } catch (e) {
+      setError(e);
+    }
   };
 
   return (
@@ -85,7 +96,8 @@ export default function ComparePage({ documents, lastEvent, connected }: Props) 
                     <input type="checkbox" checked={picked.includes(d.id)} onChange={() => toggle(d.id)} />
                     <span className="grow">
                       {d.title}
-                      {d.version > 1 && <span className="muted small"> v{d.version}</span>}
+                      {/* v1 is tagged too when a newer version exists, so the two entries can be told apart. */}
+                      {(d.version > 1 || !d.is_latest) && <span className="muted small"> v{d.version}</span>}
                     </span>
                   </label>
                 ))}
@@ -105,9 +117,10 @@ export default function ComparePage({ documents, lastEvent, connected }: Props) 
             <ErrorNote error={error} />
           </div>
           <div className="card session-list">
+            {history.length === 0 && <div className="muted small" style={{ padding: 10 }}>No comparisons yet.</div>}
             {history.map((c) => (
               <button key={c.id} className={`session-item ${c.id === activeId ? "active" : ""}`} onClick={() => setActiveId(c.id)}>
-                <span style={{ fontWeight: 600 }}>{c.document_ids.map(titleOf).join(" vs ")}</span>
+                <span style={{ fontWeight: 600 }}>{c.document_ids.map((id) => titleOf(c, id)).join(" vs ")}</span>
                 <span className="muted small">
                   {c.status} · {c.focus || "general"} · {timeAgo(c.created_at)}
                 </span>
@@ -115,31 +128,64 @@ export default function ComparePage({ documents, lastEvent, connected }: Props) 
             ))}
           </div>
         </div>
-        <div>{active ? <ComparisonView c={active} /> : <div className="card"><Empty>Pick documents to compare.</Empty></div>}</div>
+        <div>{active ? <ComparisonView
+              c={active}
+              versionOf={(id) => ready.find((d) => d.id === id)?.version}
+              onDelete={() => remove(active)}
+            /> : <div className="card"><Empty>Pick documents to compare.</Empty></div>}</div>
       </div>
     </div>
   );
 }
 
-function ComparisonView({ c }: { c: Comparison }) {
+function ComparisonView({
+  c,
+  versionOf,
+  onDelete,
+}: {
+  c: Comparison;
+  versionOf: (id: string) => number | undefined;
+  onDelete: () => void;
+}) {
   if (c.status === "pending" || c.status === "running")
     return (
       <div className="card card-pad row">
         <span className="spinner" /> Comparing documents… this usually takes 5–15 seconds.
       </div>
     );
-  if (c.status === "failed" || !c.result) return <div className="alert">{c.error_message ?? "The comparison failed."}</div>;
+  const deleteButton = (
+    <button className="btn danger sm" onClick={onDelete}>
+      Delete
+    </button>
+  );
+  if (c.status === "failed" || !c.result)
+    return (
+      <div className="alert spread">
+        <span>{c.error_message ?? "The comparison failed."}</span>
+        {deleteButton}
+      </div>
+    );
   const r = c.result;
   const labels = Object.keys(r.labels);
+  // Two versions of one document share a title, so show the version whenever it tells them apart.
+  const shownTitle = (l: string) => {
+    const { title, document_id } = r.labels[l];
+    const version = r.labels[l].version ?? versionOf(document_id); // results saved before versions were stored
+    const sameTitle = labels.filter((x) => r.labels[x].title === title).length > 1;
+    return version && (version > 1 || sameTitle) ? `${title} v${version}` : title;
+  };
   return (
     <div className="stack">
       <div className="card card-pad stack">
-        <div className="row">
-          {labels.map((l) => (
-            <span key={l} className="badge">
-              {l}: {r.labels[l].title}
-            </span>
-          ))}
+        <div className="spread">
+          <div className="row">
+            {labels.map((l) => (
+              <span key={l} className="badge">
+                {l}: {shownTitle(l)}
+              </span>
+            ))}
+          </div>
+          {deleteButton}
         </div>
         <p className="prose" style={{ margin: 0 }}>
           {r.overview}

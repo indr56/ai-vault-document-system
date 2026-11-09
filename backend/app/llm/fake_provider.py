@@ -17,6 +17,7 @@ from app.core.config import Settings
 from app.llm.base import Completion, Embeddings, Message, StreamEvent, StructuredCompletion, Usage
 from app.llm.prompts.chat import ABSTAIN_PREFIX
 from app.llm.schemas import (
+    AnsweredSuggestions,
     ComparisonOutput,
     DocumentBrief,
     Entities,
@@ -80,6 +81,8 @@ class FakeProvider:
             value = SectionNotes(notes=text.split("<section>", 1)[-1][:2000])
         elif response_model is FollowUpQuestions:
             value = FollowUpQuestions(questions=["What are the key dates?", "Are there any exclusions?"])
+        elif response_model is AnsweredSuggestions:
+            value = AnsweredSuggestions(answered=[])  # tests decide what counts as answered
         elif response_model is ComparisonOutput:
             value = ComparisonOutput(
                 overview="The documents are compared below.",

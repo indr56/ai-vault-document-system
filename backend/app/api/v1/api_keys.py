@@ -4,6 +4,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import error_responses
 from app.core.rate_limit import rate_limited
 from app.db.session import get_db
 from app.models import User
@@ -34,6 +35,7 @@ async def list_api_keys(db: DB, user: CurrentUser) -> list[ApiKeyOut]:
 
 @router.delete(
     "/{key_id}",
+    responses=error_responses(409),
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Revoke an API key (not the one making this request)",
 )

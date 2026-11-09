@@ -36,7 +36,7 @@ from app.models.enums import DocumentStatus, InsightsStatus, ProcessingStage, Ru
 from app.services import cache, events
 from app.services.chunking import ChunkData, chunk_document
 from app.services.insights import generate_insights
-from app.services.jobs import TransientJobError, clear_enqueued, redis_lock
+from app.services.jobs import TransientJobError, clear_enqueued, document_lock_key, redis_lock
 from app.services.parsing import ParsedDocument, ParseError, parse_document
 from app.services.storage import get_storage
 from app.services.usage import failed_calls_to, record_entry, record_usage
@@ -62,7 +62,7 @@ def _ms(start: float) -> int:
 
 @contextmanager
 def document_lock(document_id: uuid.UUID) -> Iterator[bool]:
-    with redis_lock(f"lock:document:{document_id}", LOCK_TTL_SECONDS) as acquired:
+    with redis_lock(document_lock_key(document_id), LOCK_TTL_SECONDS) as acquired:
         yield acquired
 
 
@@ -339,9 +339,11 @@ def analyze_document(db: Session, document: Document, parsed: ParsedDocument, re
 def regenerate_insights(document_id: uuid.UUID) -> str:
     """Re-run only the analysis step (e.g. after an insights failure or a prompt change).
 
-    Always ends with insights_status ready or failed, never stuck at "pending": a file that can no
-    longer be read, or a timeout, marks the insights failed (the document itself stays chat-ready).
+    Always ends with insights_status ready or failed, never stuck at "pending": any error reading
+    the file again (missing, corrupt, a parser bug) or a timeout marks the insights failed; the
+    document itself stays chat-ready. A worker killed outright is handled by the requeue sweep.
     """
+    clear_enqueued("insights", document_id)  # picked up: no longer waiting in the broker
     with document_lock(document_id) as acquired:
         if not acquired:
             return "skipped_locked"  # the document is being (re)processed, which produces insights anyway
@@ -356,7 +358,7 @@ def regenerate_insights(document_id: uuid.UUID) -> str:
             db.commit()
             try:
                 parsed = parse_document(get_storage().path(document.storage_path), document.extension)
-            except (ParseError, OSError, SoftTimeLimitExceeded) as exc:
+            except Exception as exc:  # incl. SoftTimeLimitExceeded; a parser bug must not leave "pending"
                 logger.exception("insights_regeneration_failed", document_id=str(document.id))
                 document.insights_status = InsightsStatus.FAILED
                 run.status = RunStatus.FAILED

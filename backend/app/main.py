@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import structlog
 from fastapi import FastAPI, Request, Response
@@ -15,8 +16,9 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.health import router as health_router
 from app.api.v1 import api_router
+from app.core.body_limit import BodyLimitMiddleware
 from app.core.config import get_settings
-from app.core.errors import register_exception_handlers
+from app.core.errors import ERROR_DESCRIPTIONS, register_exception_handlers
 from app.core.logging import configure_logging, get_logger
 from app.core.security import ensure_demo_user
 from app.db.session import get_async_engine, get_async_sessionmaker
@@ -48,6 +50,28 @@ async def _store_request_metric(metric: RequestMetric) -> None:
         logger.warning("request_metric_failed", exc_info=True)
 
 
+def _with_not_found_responses(app: FastAPI, prefix: str) -> None:
+    """Every API route with an id in its path can answer 404 (missing, or another user's); list it in
+    /docs with the shared error schema instead of leaving it "Undocumented"."""
+    generate = app.openapi
+
+    def openapi() -> dict[str, Any]:
+        if app.openapi_schema is not None:
+            return app.openapi_schema
+        schema = generate()
+        not_found = {
+            "description": ERROR_DESCRIPTIONS[404],
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        }
+        for path, operations in schema["paths"].items():
+            if path.startswith(prefix) and "{" in path:
+                for operation in operations.values():
+                    operation["responses"].setdefault("404", not_found)
+        return schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
@@ -66,6 +90,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(BodyLimitMiddleware)  # outermost: refuses oversized bodies before anything reads them
 
     @app.middleware("http")
     async def request_context(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
@@ -107,6 +132,7 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
     app.include_router(health_router)
     app.include_router(api_router, prefix=settings.api_prefix)
+    _with_not_found_responses(app, settings.api_prefix)
 
     if STATIC_DIR.is_dir():  # the built React UI (copied in by the Docker build)
         app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")

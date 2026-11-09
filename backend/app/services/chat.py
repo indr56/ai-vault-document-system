@@ -27,15 +27,16 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.errors import NotFoundError, NotReadyError
+from app.core.errors import ConflictError, NotFoundError, NotReadyError
 from app.core.logging import get_logger
 from app.db.base import utcnow
 from app.llm import get_provider
 from app.llm.base import Message, Usage
 from app.llm.prompts import chat as chat_prompt
+from app.llm.prompts import followup_check as followup_check_prompt
 from app.llm.prompts import followups as followups_prompt
 from app.llm.prompts import rewrite as rewrite_prompt
-from app.llm.schemas import FollowUpQuestions
+from app.llm.schemas import AnsweredSuggestions, FollowUpQuestions
 from app.models import ChatMessage, ChatSession, Document, DocumentInsight, User
 from app.models.enums import DocumentStatus, MessageRole
 from app.services import cache, events
@@ -185,6 +186,11 @@ async def prepare_question(
         for d in session.documents
         if d.status != DocumentStatus.READY
     ]
+    if not session.documents:  # every document of this chat was deleted since it started
+        raise ConflictError(
+            "The documents in this chat were deleted. Start a new chat to ask about other documents.",
+            code="chat_documents_deleted",
+        )
     if not ready:
         raise NotReadyError(
             "None of the documents in this chat are ready yet. Wait for processing to finish.",
@@ -209,7 +215,7 @@ async def prepare_question(
 
     versions = [f"{d.id}:{d.processed_at.isoformat() if d.processed_at else ''}" for d in ready]
     # A cached entry holds the answer AND its follow-ups, so a change to either prompt starts fresh.
-    prompts = f"{chat_prompt.VERSION}+{followups_prompt.VERSION}"
+    prompts = f"{chat_prompt.VERSION}+{followups_prompt.VERSION}+{followup_check_prompt.VERSION}"
     prepared.cache_key = cache.answer_cache_key(str(user.id), versions, prepared.standalone_question, prompts)
     prepared.semantic_index_key = cache.semantic_index_key(str(user.id), versions, prompts)
     if use_cache:
@@ -222,7 +228,7 @@ async def prepare_question(
     embedding = await _embed_query(prepared.standalone_question, prepared)
     prepared.embedding = embedding
     if use_cache:
-        match = await cache.afind_semantic(prepared.semantic_index_key, embedding)
+        match = await cache.afind_semantic(prepared.semantic_index_key, prepared.standalone_question, embedding)
         if match is not None:
             answer_key, matched_question, similarity = match
             prepared.cached = await cache.aget_json(answer_key)
@@ -255,10 +261,9 @@ async def prepare_question(
 def extract_citations(answer: str, prepared: PreparedQuestion) -> list[dict[str, Any]]:
     """Map [n] markers in the answer back to the retrieved chunks (ignores invented numbers).
 
-    A "not found" answer gets no citations: listing sources under it would look like evidence for
-    an answer that doesn't exist."""
-    if answer.strip().startswith(chat_prompt.ABSTAIN_PREFIX):
-        return []
+    A "not found" answer often says what the documents DO say ("the broker is Bayline Risk Partners
+    [1][2], but no address is given"); those markers are mapped too, so they can be opened like any
+    other citation. The answer still counts as abstained, not grounded (see _save_exchange)."""
     titles = {d.id: d.title for d in prepared.documents}
     used: list[int] = []
     for match in CITATION_RE.finditer(answer):
@@ -319,39 +324,119 @@ async def _llm_follow_ups(prepared: PreparedQuestion) -> list[str]:
 
 
 FOLLOW_UPS_SHOWN = 3
-# A candidate this close in meaning to the answer restates it ("Is the flood deductible per
-# occurrence?" after "The flood deductible is $50,000 per occurrence" scored 0.84); measured on
-# text-embedding-3-small, genuine follow-ups scored at most 0.61 against the answer.
-FOLLOW_UP_REPEAT_SIMILARITY = 0.75
+# The embedding half of the repeat check (the model check is the other half): a suggestion this close
+# to one line of the answer restates it. Measured with text-embedding-3-small on the walkthrough's
+# answers (9 Nov): genuine follow-ups scored at most 0.63 against their closest line; the one repeat
+# the model check misses ("Who is the Facilities Manager to notify within 24 hours?") scored 0.69.
+# Comparing with the whole answer (the first version) hid repeats inside long answers.
+FOLLOW_UP_LINE_SIMILARITY = 0.66
+# A suggestion this close to a question the user already asked in this chat re-asks it. Measured on
+# the 9 Nov walkthrough: re-asks scored 0.68-0.69 against the earlier question, others at most 0.58.
+FOLLOW_UP_ASKED_SIMILARITY = 0.60
+MAX_ANSWER_LINES = 12
+EXTRA_SUGGESTIONS = 5  # from the documents' insights, used when too few model suggestions are new
+
+_CITATION_MARK = re.compile(r"\[\d+\]")
 
 
-async def pick_follow_ups(prepared: PreparedQuestion, answer: str, candidates: list[str]) -> list[str]:
-    """Keep the suggestions that add the most beyond the answer.
+def answer_lines(answer: str) -> list[str]:
+    """The answer's facts, one per line or sentence, without citation marks or bullets; headings
+    ("Property policy deductibles:") and fragments under 4 words are left out."""
+    lines: list[str] = []
+    for raw in answer.splitlines():
+        text = _CITATION_MARK.sub("", raw).strip(" -*\u2022\t")
+        if text.endswith(":"):
+            continue  # a heading ("General liability quote deductible:"), not a fact
+        lines += [s.strip() for s in re.split(r"(?<=[.;])\s+", text) if len(s.split()) >= 4]
+    return lines[:MAX_ANSWER_LINES] or [answer]
 
-    One embedding call (the answer + the candidates, ~100 tokens) and a cosine against the answer:
-    candidates above FOLLOW_UP_REPEAT_SIMILARITY are dropped, and of the rest the 3 least similar to
-    the answer are kept, in the model's original order. Within one question, candidates that restate
-    the answer are consistently the closest to it, so ranking separates them where a single global
-    threshold can't. Best effort: if the call fails, the first 3 are shown unfiltered.
-    """
-    if not candidates:
-        return []
+
+def _earlier_answers(prepared: PreparedQuestion) -> list[str]:
+    """This chat's previous answers, most recent first."""
+    return [str(m["content"]) for m in reversed(prepared.history) if m["role"] == MessageRole.ASSISTANT]
+
+
+async def _answered_by_model(prepared: PreparedQuestion, answer: str, suggestions: list[str]) -> set[int] | None:
+    """Indexes of the suggestions the fast model says this answer, or an earlier answer in the chat,
+    already covers; None if the call failed."""
     provider = get_provider()
     try:
+        with failed_calls_to(
+            prepared.usages.append, "check_follow_ups", provider.fast_model, followup_check_prompt.VERSION
+        ):
+            result = await provider.acomplete_structured(
+                followup_check_prompt.build_messages(answer, suggestions, _earlier_answers(prepared)),
+                AnsweredSuggestions,
+                model=provider.fast_model,
+                max_tokens=200,
+            )
+    except Exception:
+        logger.warning("follow_ups_check_failed", exc_info=True)
+        return None
+    prepared.usages.append(UsageEntry("check_follow_ups", result.usage, followup_check_prompt.VERSION))
+    return {n - 1 for n in result.value.answered if 1 <= n <= len(suggestions)}
+
+
+async def _closeness(
+    prepared: PreparedQuestion, answer: str, suggestions: list[str]
+) -> tuple[list[float], list[float]] | None:
+    """One embedding call. For each suggestion: its similarity to the closest line of the answer, and
+    to the closest question the user already asked in this chat. None if the call failed."""
+    provider = get_provider()
+    lines = answer_lines(answer)
+    asked = list(dict.fromkeys(_asked_questions(prepared)))
+    try:
         with failed_calls_to(prepared.usages.append, "embed_follow_ups", provider.embedding_model):
-            result = await provider.aembed([answer, *candidates])
+            result = await provider.aembed([*lines, *asked, *suggestions])
     except Exception:
         logger.warning("follow_ups_rank_failed", exc_info=True)
-        return candidates[:FOLLOW_UPS_SHOWN]
+        return None
     prepared.usages.append(UsageEntry("embed_follow_ups", result.usage))
-    answer_vector, vectors = result.vectors[0], result.vectors[1:]
-    scored = [
-        (cache.cosine(answer_vector, vector), i)
-        for i, vector in enumerate(vectors)
-        if cache.cosine(answer_vector, vector) < FOLLOW_UP_REPEAT_SIMILARITY
-    ]
-    keep = sorted(i for _, i in sorted(scored)[:FOLLOW_UPS_SHOWN])
-    return [candidates[i] for i in keep]
+    line_vectors = result.vectors[: len(lines)]
+    asked_vectors = result.vectors[len(lines) : len(lines) + len(asked)]
+    vectors = result.vectors[len(lines) + len(asked) :]
+    to_lines = [max(cache.cosine(line, v) for line in line_vectors) for v in vectors]
+    to_asked = [max((cache.cosine(q, v) for q in asked_vectors), default=0.0) for v in vectors]
+    return to_lines, to_asked
+
+
+async def pick_follow_ups(
+    prepared: PreparedQuestion, answer: str, candidates: list[str], extras: list[str] | None = None
+) -> list[str]:
+    """Up to 3 suggestions that ask for something the answer doesn't already say.
+
+    The model's candidates were written in parallel with the answer, so some ask for facts the answer
+    then states, or that the conversation already covered. Two checks run at the same time (~1 s,
+    after the answer): the fast model reads the answer (and the chat's earlier answers) and lists the
+    suggestions they cover; an embedding call scores each suggestion against the closest line of the
+    answer and the closest question already asked. A suggestion any check flags is dropped. Of the rest, the
+    model's candidates come first (least like the answer first), then `extras` (the documents' own
+    suggested questions, checked the same way) fill any gap. Shown in their original order.
+    If both checks fail, the first 3 candidates are shown unchecked.
+    """
+    suggestions = list(dict.fromkeys([*candidates, *(extras or [])]))
+    if not suggestions:
+        return []
+    answered, scores = await asyncio.gather(
+        _answered_by_model(prepared, answer, suggestions), _closeness(prepared, answer, suggestions)
+    )
+    if answered is None and scores is None:
+        return suggestions[:FOLLOW_UPS_SHOWN]
+
+    def repeats(i: int) -> bool:
+        if answered is not None and i in answered:
+            return True
+        if scores is not None:
+            to_line, to_asked = scores[0][i], scores[1][i]
+            return to_line >= FOLLOW_UP_LINE_SIMILARITY or to_asked >= FOLLOW_UP_ASKED_SIMILARITY
+        return False
+
+    new = [i for i in range(len(suggestions)) if not repeats(i)]
+    from_model = [i for i in new if i < len(candidates)]
+    if scores is not None:
+        from_model.sort(key=lambda i: scores[0][i])
+    chosen = (from_model + [i for i in new if i >= len(candidates)])[:FOLLOW_UPS_SHOWN]
+    return [suggestions[i] for i in sorted(chosen)]
 
 
 def _start_follow_ups(prepared: PreparedQuestion) -> "asyncio.Task[list[str]] | None":
@@ -438,15 +523,22 @@ async def _finish_follow_ups(
     abstained: bool,
 ) -> list[str]:
     asked = _asked_questions(prepared)
+    extras = [q for q in await _insight_questions(db, prepared.documents) if not _already_asked(q, asked)]
     if abstained or task is None:
         if task is not None:
             await task  # already paid for; let it finish so its usage is recorded, but don't show it
-        # "Not found": suggest what IS covered, minus what the user already asked.
-        return [q for q in await _insight_questions(db, prepared.documents) if not _already_asked(q, asked)][
-            :FOLLOW_UPS_SHOWN
-        ]
+        # "Not found": suggest what the documents DO cover, minus what this chat already asked or answered.
+        return await pick_follow_ups(prepared, answer, [], extras[:EXTRA_SUGGESTIONS])
     candidates = [q for q in await task if not _already_asked(q, asked)]
-    return await pick_follow_ups(prepared, answer, candidates)
+    return await pick_follow_ups(prepared, answer, candidates, extras[:EXTRA_SUGGESTIONS])
+
+
+def _cached_follow_ups(prepared: PreparedQuestion) -> list[str]:
+    """A reused answer brings the suggestions saved with it; drop any this chat has already asked
+    (a word-level check, so a cached answer stays instant, with no AI call)."""
+    assert prepared.cached is not None
+    asked = _asked_questions(prepared)
+    return [q for q in prepared.cached["follow_ups"] if not _already_asked(q, asked)]
 
 
 def _abstain_text() -> str:
@@ -660,7 +752,7 @@ async def _ask(
             prepared,
             answer=prepared.cached["answer"],
             citations=prepared.cached["citations"],
-            follow_ups=prepared.cached["follow_ups"],
+            follow_ups=_cached_follow_ups(prepared),
             answer_usage=None,
             from_cache=True,
             started=started,
@@ -749,7 +841,7 @@ async def _ask_stream(
 
     if from_cache:
         assert prepared.cached is not None
-        citations, follow_ups = prepared.cached["citations"], prepared.cached["follow_ups"]
+        citations, follow_ups = prepared.cached["citations"], _cached_follow_ups(prepared)
     else:
         citations = extract_citations(answer, prepared)
         abstained = answer.startswith(chat_prompt.ABSTAIN_PREFIX)

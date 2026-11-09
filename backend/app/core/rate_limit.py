@@ -1,4 +1,7 @@
-"""Per-API-key rate limiting (fixed one-minute windows in Redis) and a daily AI token quota."""
+"""Per-user rate limiting (fixed one-minute windows in Redis) and a daily AI token quota.
+
+Per user, not per API key: a user can create several keys (/api-keys), and creating more keys
+must not multiply their limits or quota."""
 
 import time
 from datetime import UTC, datetime, timedelta

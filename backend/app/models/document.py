@@ -129,6 +129,9 @@ class DocumentInsight(Timestamps, Base):
     sentiment: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     suggested_questions: Mapped[list[str]] = mapped_column(JSONB, default=list)
     language: Mapped[str | None] = mapped_column(String(20))
+    # For a document too long to read whole: the condensed notes (map-reduce) the insights were
+    # written from. Custom summaries reuse them instead of running the map step inside a request.
+    analysis_text: Mapped[str | None] = mapped_column(Text)
     model: Mapped[str] = mapped_column(String(100), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(20), nullable=False)
 

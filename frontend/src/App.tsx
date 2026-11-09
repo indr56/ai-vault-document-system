@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Icon } from "./components/ui";
-import { api, getApiKey, setApiKey } from "./lib/api";
+import { getApiKey, listAll, setApiKey } from "./lib/api";
 import { useVaultEvents } from "./lib/events";
 import type { DocumentItem, VaultEvent } from "./lib/types";
 import ChatPage from "./pages/ChatPage";
@@ -18,7 +18,11 @@ const NAV: { id: Page; label: string; icon: "docs" | "chat" | "compare" | "chart
 ];
 
 export default function App() {
-  const [page, setPage] = useState<Page>(() => (location.hash.slice(1) as Page) || "documents");
+  // An unknown or empty #hash opens Documents (it used to render an empty page).
+  const [page, setPage] = useState<Page>(() => {
+    const fromHash = location.hash.slice(1) as Page;
+    return NAV.some((n) => n.id === fromHash) ? fromHash : "documents";
+  });
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [chatSeed, setChatSeed] = useState<string[] | null>(null);
@@ -38,10 +42,10 @@ export default function App() {
     history.replaceState(null, "", `#${next}`);
   };
 
+  // Every page of the list, not just the first 200 (an account can hold up to 10,000 documents).
   const refreshDocuments = useCallback(async () => {
     try {
-      const data = await api<{ items: DocumentItem[] }>("/documents?limit=200");
-      setDocuments(data.items);
+      setDocuments(await listAll<DocumentItem>("/documents"));
       setLoadError(null);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
@@ -52,11 +56,17 @@ export default function App() {
     void refreshDocuments();
   }, [refreshDocuments]);
 
-  // Live updates: any document event refreshes the list; pages can react to the raw event too.
+  // Live updates: document events refresh the list; pages can react to the raw event too. Events come
+  // in bursts (a 20-file batch sends ~100 stage events), so they are coalesced into one reload
+  // 300 ms after the last one instead of one reload per event.
+  const refreshTimer = useRef<number | undefined>(undefined);
   const connected = useVaultEvents((event) => {
     setLastEvent(event);
-    if (event.type.startsWith("document.")) void refreshDocuments();
+    if (!event.type.startsWith("document.")) return;
+    window.clearTimeout(refreshTimer.current);
+    refreshTimer.current = window.setTimeout(() => void refreshDocuments(), 300);
   });
+  useEffect(() => () => window.clearTimeout(refreshTimer.current), []);
 
   // Fallback polling while something is in flight, in case the WebSocket is unavailable.
   const inFlight = documents.some((d) => d.status === "queued" || d.status === "processing" || d.insights_status === "pending");

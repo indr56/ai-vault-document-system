@@ -47,6 +47,28 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return parse<T>(await fetch(`${API}${path}`, { ...init, headers }));
 }
 
+/** Every page of a paged list endpoint (documents: up to 200 per request; chats: up to 100). */
+export async function listAll<T>(path: string, pageSize = 200): Promise<T[]> {
+  const all: T[] = [];
+  const sep = path.includes("?") ? "&" : "?";
+  for (let offset = 0; ; offset += pageSize) {
+    const data = await api<{ items: T[]; total: number }>(`${path}${sep}limit=${pageSize}&offset=${offset}`);
+    all.push(...data.items);
+    if (data.items.length < pageSize || all.length >= data.total) return all;
+  }
+}
+
+/** Saves a file from the API. A plain link can't send the X-API-Key header, so fetch it and hand the
+ * browser a temporary object URL to save. */
+export async function download(path: string, filename: string): Promise<void> {
+  const response = await fetch(`${API}${path}`, { headers: { "X-API-Key": getApiKey() } });
+  if (!response.ok) await parse(response); // throws the API's error
+  const url = URL.createObjectURL(await response.blob());
+  const link = Object.assign(document.createElement("a"), { href: url, download: filename });
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
 export const post = <T,>(path: string, body?: unknown) =>
   api<T>(path, { method: "POST", body: body instanceof FormData ? body : JSON.stringify(body ?? {}) });
 

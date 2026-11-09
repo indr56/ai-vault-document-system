@@ -30,10 +30,16 @@ export default function MetricsPage({ lastEvent }: { lastEvent: VaultEvent | nul
     }
   }, [days]);
 
+  // Refresh every 15 s while the tab is visible; a hidden tab doesn't poll, and catches up when shown.
   useEffect(() => {
     void load();
-    const t = window.setInterval(load, 15000);
-    return () => window.clearInterval(t);
+    const t = window.setInterval(() => document.visibilityState === "visible" && void load(), 15000);
+    const onVisible = () => document.visibilityState === "visible" && void load();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [load]);
   useEffect(() => {
     if (lastEvent?.type === "document.ready" || lastEvent?.type === "document.failed") void load();

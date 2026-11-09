@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 type Note = { id: number; kind: "info" | "error"; text: string };
 let noteSeq = 0;
 import { Empty, ErrorNote, InsightsBadge, StatusBadge } from "../components/ui";
-import { api, fileTypesLabel, formatBytes, post, timeAgo, useUploadConfig } from "../lib/api";
+import { api, download, fileTypesLabel, formatBytes, post, timeAgo, useUploadConfig } from "../lib/api";
 import type { DocumentItem, Insights, ProcessingRun, SummaryResult, UploadResult, VaultEvent } from "../lib/types";
 
 interface Props {
@@ -334,14 +334,22 @@ function DocumentDetail({
           <button className="btn sm" onClick={() => versionInput.current?.click()}>
             Upload new version
           </button>
+          <button className="btn sm" onClick={() => action(() => download(`/documents/${doc.id}/file`, doc.original_filename))}>
+            Download
+          </button>
           <input
             ref={versionInput}
             type="file"
             hidden
             accept={uploadRules?.allowed_extensions.join(",")}
-            onChange={(e) => e.target.files?.[0] && onNewVersion(e.target.files[0])}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = ""; // so picking the same file again (e.g. after an error) fires again
+              if (file) onNewVersion(file);
+            }}
           />
-          {(doc.status === "failed" || doc.status === "ready") && (
+          {/* Not while insights are still being written: that job holds the document (the API refuses too). */}
+          {(doc.status === "failed" || (doc.status === "ready" && doc.insights_status !== "pending")) && (
             <button className="btn sm" onClick={() => action(() => post(`/documents/${doc.id}/reprocess`))}>
               Reprocess
             </button>
@@ -458,9 +466,7 @@ function InsightsTab({ doc, lastEvent }: { doc: DocumentItem; lastEvent: VaultEv
           </span>
         ))}
       </div>
-      <div className="muted small">
-        {data.model} · {data.prompt_version}
-      </div>
+      {/* The model and prompt version are kept in the API and on Monitoring, not shown to readers. */}
     </div>
   );
 }
@@ -525,9 +531,11 @@ function SummaryTab({ doc }: { doc: DocumentItem }) {
       {result && (
         <div className="card card-pad">
           <div className="prose">{result.summary}</div>
-          <div className="muted small" style={{ marginTop: 8 }}>
-            {result.cached ? "Served from storage" : "Generated"} · {result.model}
-          </div>
+          {result.cached && (
+            <div className="muted small" style={{ marginTop: 8 }}>
+              Saved earlier for these options, so it appeared instantly.
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -581,12 +589,16 @@ function ProcessingTab({ doc, lastEvent }: { doc: DocumentItem; lastEvent: Vault
   if (!runs.length) return <Empty>Waiting for a worker…</Empty>;
   return (
     <div className="timeline">
-      {runs.map((run) => {
+      {runs.map((run, i) => {
         const total = run.stages.reduce((s, x) => s + (x.duration_ms ?? 0), 0) || 1;
         return (
           <div key={run.id} className="card card-pad stack">
             <div className="spread">
-              <strong>Attempt {run.attempt}</strong>
+              {/* Runs are newest first. "attempt" counts automatic retries within one processing request. */}
+              <strong>
+                Run {runs.length - i}
+                {run.attempt > 1 && <span className="muted small"> · automatic retry {run.attempt - 1}</span>}
+              </strong>
               <span className={`badge ${run.status === "succeeded" ? "ok" : run.status === "failed" ? "bad" : "info"}`}>
                 {run.status}
               </span>

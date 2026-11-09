@@ -221,56 +221,127 @@ async def test_reuploading_a_failed_file_reprocesses_it(client: httpx.AsyncClien
 
 
 # ------------------------------------------------------------------ follow-ups that restate the answer (#46)
-async def test_follow_ups_that_restate_the_answer_are_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.llm.base import Embeddings, Usage
+# The deductibles answer from the 9 Nov walkthrough (3-document chat), and the suggestions it got.
+DEDUCTIBLES_ANSWER = """- Property policy deductibles:
+  - "All other perils deductible: $10,000 per occurrence." [2]
+  - "Flood deductible: $50,000 per occurrence." [2]
+  - "Earthquake deductible: 5% of the total insured value at the affected location, subject to a minimum of $100,000." [2]
+  - "Windstorm deductible: 2% of the building limit." [2]
+
+- General liability quote deductible:
+  - "Deductible: $2,500 per claim (bodily injury and property damage)." [1]"""
+
+
+def _prepared():  # type: ignore[no-untyped-def]
     from app.services import chat as chat_service
 
-    answer = "The flood deductible is $50,000 per occurrence [1]."
-    candidates = [
-        "Is the flood deductible per occurrence?",  # restates the answer
-        "What is the flood annual aggregate limit?",
-        "What is the deductible for all other perils?",
-        "Is the flood deductible per occurrence or annual aggregate?",  # restates the answer
-        "What is the earthquake deductible minimum amount?",
-    ]
-    # Similarities to the answer as measured with text-embedding-3-small on 9 Nov:
-    # 0.841, 0.603, 0.567, 0.807, 0.539 -> unit vectors whose dot product with the answer equals them.
-    similarity = [0.841, 0.603, 0.567, 0.807, 0.539]
-
-    def vec(s: float) -> list[float]:
-        return [s, (1 - s * s) ** 0.5]
-
-    async def fake_embed(texts: list[str]) -> Embeddings:
-        assert texts == [answer, *candidates]  # one call: the answer plus every candidate
-        return Embeddings([[1.0, 0.0], *[vec(s) for s in similarity]], Usage("emb", prompt_tokens=60))
-
-    monkeypatch.setattr(get_provider(), "aembed", fake_embed)
-    prepared = chat_service.PreparedQuestion(
-        question="How much is the flood deductible?",
-        standalone_question="How much is the flood deductible?",
+    return chat_service.PreparedQuestion(
+        question="And what about the deductibles?",
+        standalone_question="What are the deductibles for the property policy and the general liability quote?",
         documents=[],
         history=[],
     )
-    picked = await chat_service.pick_follow_ups(prepared, answer, candidates)
-    assert picked == [  # the 3 least similar to the answer, in the model's order
-        "What is the flood annual aggregate limit?",
-        "What is the deductible for all other perils?",
-        "What is the earthquake deductible minimum amount?",
-    ]
-    assert [u.operation for u in prepared.usages] == ["embed_follow_ups"]
 
 
-async def test_follow_ups_shown_unfiltered_if_ranking_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+def _checks(
+    monkeypatch: pytest.MonkeyPatch,
+    answered: list[int] | None,
+    closeness: list[float] | None,
+    to_asked: list[float] | None = None,
+    seen: dict | None = None,
+) -> None:
+    """Fake the two checks: the model's list of answered suggestions (1-based), and each suggestion's
+    similarity to its closest answer line (`closeness`) and to the closest question already asked
+    (`to_asked`, default 0). None makes that call fail. `seen` records what the model was shown."""
+    from app.llm.base import Embeddings, StructuredCompletion, Usage
+    from app.llm.schemas import AnsweredSuggestions
     from app.services import chat as chat_service
 
-    async def broken(texts: list[str]) -> None:
-        raise RuntimeError("embeddings down")
+    provider = get_provider()
 
-    monkeypatch.setattr(get_provider(), "aembed", broken)
-    prepared = chat_service.PreparedQuestion(question="q", standalone_question="q", documents=[], history=[])
-    picked = await chat_service.pick_follow_ups(prepared, "answer", ["a?", "b?", "c?", "d?"])
-    assert picked == ["a?", "b?", "c?"]  # suggestions still shown; the failed call is recorded
-    assert prepared.usages[0].success is False
+    async def judge(messages, response_model, **kwargs):  # type: ignore[no-untyped-def]
+        assert response_model is AnsweredSuggestions
+        if seen is not None:
+            seen["prompt"] = messages[-1]["content"]
+        if answered is None:
+            raise RuntimeError("model down")
+        return StructuredCompletion(AnsweredSuggestions(answered=answered), Usage(provider.fast_model, 300, 10))
+
+    async def embed(texts: list[str]) -> Embeddings:
+        if closeness is None:
+            raise RuntimeError("embeddings down")
+        lines = chat_service.answer_lines(DEDUCTIBLES_ANSWER)
+        n_asked = len(texts) - len(lines) - len(closeness)
+        assert texts[: len(lines)] == lines  # one call: the answer's lines, the questions asked, the suggestions
+        asked_sims = to_asked or [0.0] * len(closeness)
+        vectors = [[1.0, 0.0, 0.0]] * len(lines) + [[0.0, 1.0, 0.0]] * n_asked
+        vectors += [
+            [line, asked, max(0.0, 1 - line * line - asked * asked) ** 0.5]
+            for line, asked in zip(closeness, asked_sims, strict=True)
+        ]
+        return Embeddings(vectors, Usage("emb", prompt_tokens=80))
+
+    monkeypatch.setattr(provider, "acomplete_structured", judge)
+    monkeypatch.setattr(provider, "aembed", embed)
+
+
+WALKTHROUGH_SUGGESTIONS = [
+    "What is the general liability deductible per claim amount?",  # repeats the answer
+    "What earthquake deductible formula and minimum apply?",  # repeats the answer
+    "What windstorm deductible percentage applies under the property policy?",  # repeats the answer
+    "What is the flood coverage annual aggregate limit?",
+    "How soon must a loss be reported to the insurer?",
+]
+# Similarity to the closest answer line, measured with text-embedding-3-small on 9 Nov.
+WALKTHROUGH_CLOSENESS = [0.59, 0.74, 0.75, 0.63, 0.36]
+
+
+async def test_follow_ups_the_answer_already_covers_are_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import chat as chat_service
+
+    extras = ["What is the coinsurance percentage?"]  # a document's own suggested question
+    # Say the model flags 2 of the repeats; the third (0.75 to its line) is caught by the similarity.
+    _checks(monkeypatch, answered=[1, 2], closeness=[*WALKTHROUGH_CLOSENESS, 0.41])
+    prepared = _prepared()
+    picked = await chat_service.pick_follow_ups(prepared, DEDUCTIBLES_ANSWER, WALKTHROUGH_SUGGESTIONS, extras)
+    # Was: all 3 repeats shown. Now the 2 new model suggestions, topped up with the document's own.
+    assert picked == [
+        "What is the flood coverage annual aggregate limit?",
+        "How soon must a loss be reported to the insurer?",
+        "What is the coinsurance percentage?",
+    ]
+    assert sorted(u.operation for u in prepared.usages) == ["check_follow_ups", "embed_follow_ups"]
+
+
+async def test_answer_lines_are_the_facts_of_the_answer() -> None:
+    from app.services import chat as chat_service
+
+    lines = chat_service.answer_lines(DEDUCTIBLES_ANSWER)
+    # Each fact is its own line, scored on its own: against the whole answer the earthquake repeat
+    # scored 0.58, against its line 0.74. Headings and citation marks are left out.
+    assert not any(line.endswith(":") or "[" in line for line in lines)
+    assert any(line.startswith('"Earthquake deductible') for line in lines) and len(lines) == 5
+
+
+@pytest.mark.parametrize(
+    ("answered", "closeness", "shown"),
+    [
+        (None, WALKTHROUGH_CLOSENESS, [0, 3, 4]),  # model check down: similarity alone drops 2 (0.59 gets through)
+        ([1, 2, 3], None, [3, 4]),  # embeddings down: the model check alone
+        (None, None, [0, 1, 2]),  # both down: the first 3, unchecked (and both failures recorded)
+    ],
+)
+async def test_follow_ups_when_a_check_fails(
+    monkeypatch: pytest.MonkeyPatch, answered: list[int] | None, closeness: list[float] | None, shown: list[int]
+) -> None:
+    from app.services import chat as chat_service
+
+    _checks(monkeypatch, answered, closeness)
+    prepared = _prepared()
+    picked = await chat_service.pick_follow_ups(prepared, DEDUCTIBLES_ANSWER, WALKTHROUGH_SUGGESTIONS)
+    assert picked == [WALKTHROUGH_SUGGESTIONS[i] for i in shown]
+    failed = [u.operation for u in prepared.usages if not u.success]
+    assert len(failed) == (answered is None) + (closeness is None)
 
 
 @pytest.mark.parametrize(
@@ -286,3 +357,86 @@ def test_suggestions_already_asked_in_the_chat_are_skipped(suggestion: str, aske
     from app.services.chat import _already_asked
 
     assert _already_asked(suggestion, asked) is expected
+
+
+# ------------------------------------------------------------------ found in the second UI pass (#56, #58)
+async def test_comparison_labels_carry_the_version(client: httpx.AsyncClient) -> None:
+    v1 = (await upload(client, "lease.txt", f"Lease {uuid.uuid4()}. Rent is $18,500.".encode())).json()["document"]
+    v2 = (
+        await upload(
+            client, "lease.txt", f"Lease {uuid.uuid4()}. Rent is $19,750.".encode(), replaces_document_id=v1["id"]
+        )
+    ).json()["document"]
+    created = (await client.post("/comparisons", json={"document_ids": [v2["id"], v1["id"]]})).json()
+    labels = (await client.get(f"/comparisons/{created['id']}")).json()["result"]["labels"]
+    # Both versions share the title "lease"; without the version the UI showed "A: lease" and "B: lease".
+    assert labels["A"]["title"] == labels["B"]["title"] == "lease"
+    assert (labels["A"]["version"], labels["B"]["version"]) == (2, 1)
+
+
+def test_every_endpoint_has_a_written_summary() -> None:
+    from app.main import app
+
+    generated = []
+    for path, operations in app.openapi()["paths"].items():
+        for method, operation in operations.items():
+            # Without summary=..., /docs shows the function name in title case, e.g. "Get Document"
+            # (operationId "get_document_api_v1_documents__document_id__get").
+            fallback = operation["operationId"].split("_api_v1")[0].replace("_", " ").title()
+            if operation["summary"] == fallback:
+                generated.append(f"{method.upper()} {path}")
+    assert len(app.openapi()["paths"]) > 20 and generated == []  # was: "Get Document", "List Sessions", ...
+
+
+# ------------------------------------------------------------------ follow-ups and the conversation (#83)
+async def test_follow_ups_the_conversation_already_covered_are_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import chat as chat_service
+
+    seen: dict = {}
+    earlier_answer = "The property premium is $48,750 [3]; the broker earns 10% [2]."
+    prepared = _prepared()
+    prepared.history = [
+        {"role": "user", "content": "What is the annual premium on the property policy?"},
+        {"role": "assistant", "content": earlier_answer},
+    ]
+    suggestions = [
+        "What is the flood coverage annual aggregate limit?",
+        "What is the annual premium for the Acme property policy?",  # re-asks the earlier question
+        "How soon must a loss be reported to the insurer?",
+    ]
+    # Measured 9 Nov: a re-asked question scored 0.68-0.69 against the earlier one, others at most 0.58.
+    _checks(monkeypatch, answered=[], closeness=[0.63, 0.30, 0.36], to_asked=[0.38, 0.69, 0.28], seen=seen)
+    picked = await chat_service.pick_follow_ups(prepared, DEDUCTIBLES_ANSWER, suggestions)
+    assert picked == [suggestions[0], suggestions[2]]  # was: the earlier question offered again
+    # The model check also reads the chat's earlier answers, after the new one.
+    assert "Earlier answers in this chat:\n" + earlier_answer in seen["prompt"]
+
+
+async def test_suggestions_after_not_found_are_checked_against_the_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import chat as chat_service
+
+    async def insight_questions(db, documents):  # type: ignore[no-untyped-def]
+        return [
+            "Who must be notified after a property loss, and in what order?",
+            "How long must damaged stock be kept?",
+        ]
+
+    monkeypatch.setattr(chat_service, "_insight_questions", insight_questions)
+    # The first was already answered earlier in the chat; the model check says so.
+    _checks(monkeypatch, answered=[1], closeness=[0.2, 0.2], to_asked=[0.68, 0.35])
+    prepared = _prepared()
+    shown = await chat_service._finish_follow_ups(None, prepared, None, "I couldn't find this.", abstained=True)  # type: ignore[arg-type]
+    assert shown == ["How long must damaged stock be kept?"]  # was: both, unchecked
+
+
+async def test_a_cached_answer_does_not_suggest_what_was_just_asked(
+    client: httpx.AsyncClient, ready_docs: dict[str, str]
+) -> None:
+    session_id = (await client.post("/chat/sessions", json={"document_ids": [ready_docs["policy"]]})).json()["id"]
+    url = f"/chat/sessions/{session_id}/messages"
+    first = (await client.post(url, json={"question": "What is the coinsurance?"})).json()["answer"]
+    asked = first["follow_up_questions"][0]
+    await client.post(url, json={"question": asked})  # the user clicks a suggestion
+    again = (await client.post(url, json={"question": "What is the coinsurance?"})).json()["answer"]
+    assert again["from_cache"] is True, (first["abstained"], first["content"][:80], again["content"][:80])
+    assert asked not in again["follow_up_questions"]  # was: the cached answer offered it again

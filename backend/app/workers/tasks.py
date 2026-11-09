@@ -15,11 +15,20 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.base import utcnow
 from app.db.session import sync_session
-from app.models import Comparison, Document
-from app.models.enums import ComparisonStatus, DocumentStatus, InsightsStatus
+from app.models import Comparison, Document, ProcessingRun
+from app.models.enums import ComparisonStatus, DocumentStatus, InsightsStatus, ProcessingStage, RunStatus
 from app.services import cache, events
 from app.services.comparison import run_comparison_job
-from app.services.jobs import TransientJobError, clear_enqueued, mark_enqueued, retry_countdown, waiting_in_queue
+from app.services.jobs import (
+    TransientJobError,
+    clear_enqueued,
+    document_lock_key,
+    is_locked,
+    mark_enqueued,
+    queue_backlog,
+    retry_countdown,
+    waiting_in_queue,
+)
 from app.services.processing import regenerate_insights as _regenerate
 from app.services.processing import run_pipeline
 from app.workers.celery_app import celery_app
@@ -48,7 +57,20 @@ def process_document(self, document_id: str) -> str:  # type: ignore[no-untyped-
         raise self.retry(exc=exc, countdown=countdown) from exc
     finally:
         structlog.contextvars.clear_contextvars()
+    if result.status == "skipped_locked" and _still_queued(document_id):
+        # Another job holds the lock (e.g. Reprocess clicked while insights were still being written):
+        # this request still has to run, so try again shortly instead of dropping it.
+        mark_enqueued("document", document_id)
+        process_document.apply_async((document_id,), countdown=LOCKED_RETRY_SECONDS)
     return result.status
+
+
+LOCKED_RETRY_SECONDS = 30
+
+
+def _still_queued(document_id: str) -> bool:
+    with sync_session() as db:
+        return db.scalar(select(Document.status).where(Document.id == uuid.UUID(document_id))) == DocumentStatus.QUEUED
 
 
 @celery_app.task(name="app.workers.tasks.regenerate_insights", **TIME_LIMITS)
@@ -100,7 +122,7 @@ def enqueue_comparison(comparison_id: uuid.UUID | str) -> None:
 
 
 def enqueue_insights(document_id: uuid.UUID | str) -> None:
-    regenerate_insights.delay(str(document_id))
+    _send("insights", regenerate_insights, document_id)
 
 
 @celery_app.task(name="app.workers.tasks.requeue_stale_documents")
@@ -111,7 +133,13 @@ def requeue_stale_documents() -> int:
       in the broker (e.g. the broker was down at upload time) -> send again;
     - documents `processing` / comparisons `running` for 20+ minutes (the worker died, since the hard
       time limit is 12 minutes) -> back to queued and resent while attempts remain, otherwise failed
-      with `processing_timeout`.
+      with `processing_timeout`;
+    - insights `pending` for 20+ minutes on a ready document that no job is working on and no
+      message is waiting for (the worker died mid-analysis) -> insights failed, so "Retry insights"
+      appears instead of a spinner that never ends; processing runs left `running` are closed.
+    A long backlog can outlive the 30-minute "enqueued" markers, so while a queue still has messages
+    waiting, items without a marker get it back instead of a second message; once the queue has
+    drained, anything still waiting really was lost and is resent.
     Safe to run repeatedly: every job takes a per-item lock and skips finished items.
     """
     now = utcnow()
@@ -127,8 +155,7 @@ def requeue_stale_documents() -> int:
                 .limit(REQUEUE_BATCH)
             ).scalars()
         )
-        waiting = waiting_in_queue("document", queued)
-        resend_docs += [d for d in queued if d not in waiting]
+        resend_docs += _lost("document", queued)
 
         for doc in db.execute(
             select(Document)
@@ -152,8 +179,7 @@ def requeue_stale_documents() -> int:
                 .limit(REQUEUE_BATCH)
             ).scalars()
         )
-        waiting = waiting_in_queue("comparison", pending)
-        resend_comparisons += [c for c in pending if c not in waiting]
+        resend_comparisons += _lost("comparison", pending)
         db.execute(
             update(Comparison)
             .where(Comparison.status == ComparisonStatus.RUNNING, Comparison.updated_at < stuck)
@@ -164,6 +190,18 @@ def requeue_stale_documents() -> int:
             )
         )
 
+        _fail_abandoned_insights(db, stuck)
+        db.execute(
+            update(ProcessingRun)
+            .where(ProcessingRun.status == RunStatus.RUNNING, ProcessingRun.started_at < stuck)
+            .values(
+                status=RunStatus.FAILED,
+                finished_at=now,
+                error_code="interrupted",
+                error_message="The worker stopped before this run finished.",
+            )
+        )
+
     for document_id in resend_docs:
         enqueue_document(document_id)
     for comparison_id in resend_comparisons:
@@ -171,3 +209,36 @@ def requeue_stale_documents() -> int:
     if resend_docs or resend_comparisons:
         logger.info("requeued_stale_jobs", documents=len(resend_docs), comparisons=len(resend_comparisons))
     return len(resend_docs) + len(resend_comparisons)
+
+
+def _lost(kind: str, item_ids: list[uuid.UUID]) -> list[uuid.UUID]:
+    """Items whose message is no longer in the broker (see requeue_stale_documents)."""
+    unmarked = [i for i in item_ids if i not in waiting_in_queue(kind, item_ids)]
+    if unmarked and queue_backlog(kind) > 0:
+        for item_id in unmarked:  # probably still waiting behind a long backlog: don't send twice
+            mark_enqueued(kind, item_id)
+        return []
+    return unmarked
+
+
+def _fail_abandoned_insights(db, stuck) -> None:  # type: ignore[no-untyped-def]
+    candidates = list(
+        db.execute(
+            select(Document)
+            .where(
+                Document.status == DocumentStatus.READY,
+                Document.insights_status == InsightsStatus.PENDING,
+                Document.updated_at < stuck,
+            )
+            .limit(REQUEUE_BATCH)
+        ).scalars()
+    )
+    waiting = waiting_in_queue("insights", [d.id for d in candidates])
+    for doc in candidates:
+        if doc.id in waiting or is_locked(document_lock_key(doc.id)):
+            continue  # still queued, or a job is working on it right now
+        doc.insights_status = InsightsStatus.FAILED
+        if doc.stage == ProcessingStage.ANALYZE:
+            doc.stage = None
+        logger.warning("insights_abandoned", document_id=str(doc.id))
+        events.publish(doc.owner_id, "document.insights_failed", {"document_id": doc.id})

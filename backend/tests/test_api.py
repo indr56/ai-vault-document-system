@@ -107,7 +107,7 @@ async def test_reprocess(client: httpx.AsyncClient, ready_docs: dict[str, str]) 
     doc = (await client.post(f"/documents/{ready_docs['agreement']}/reprocess")).json()
     assert doc["id"] == ready_docs["agreement"]
     after = (await client.get(f"/documents/{ready_docs['agreement']}")).json()
-    assert after["status"] == "ready" and after["attempts"] == 2
+    assert after["status"] == "ready" and after["attempts"] == 1  # a manual reprocess starts a fresh retry budget
 
 
 # ------------------------------------------------------------------ chat

@@ -106,7 +106,7 @@ export interface Comparison {
   error_message: string | null;
   created_at: string;
   result: {
-    labels: Record<string, { document_id: string; title: string }>;
+    labels: Record<string, { document_id: string; title: string; version?: number }>; // version: absent on older results
     overview: string;
     documents: { document_label: string; one_line_summary: string }[];
     similarities: string[];
