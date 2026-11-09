@@ -428,7 +428,7 @@ The growth path beyond that (roughly 100k+ documents or many concurrent users), 
 |---|---|---|
 | Upload accepted (`POST /documents`, returns 202) | 17 ms | 98 ms |
 | Document ready (parse, chunk, embed, analyse) | 4.1 s | 6.3 s |
-| Chat answer, full (non-streaming; 25-question eval) | 2.4 s | 3.1 s |
+| Chat answer, full (non-streaming; 25-question eval, two runs) | 2.4–3.1 s | 3.1–4.4 s |
 | Chat answer, streaming: response starts | 15 ms | 31 ms |
 | Comparison accepted (`POST /comparisons`, runs in the background) | 21 ms | 42 ms |
 | Document list | 8 ms | 26 ms |
@@ -472,7 +472,7 @@ Latest eval run (gpt-5.4-mini with low reasoning for chat answers, chat-v7, all 
 
 ```
 answer_accuracy 1.0 · citation_doc_acc 1.0 · citation_page_acc 1.0 · abstention_acc 1.0 · false_abstention 0.0
-dangling_citation_marks 0 · wrong_amounts 0 · follow_up_repeat 0.018 · latency p50 2.4 s · p95 3.1 s · cost $0.048 for 25 questions
+dangling_citation_marks 0 · wrong_amounts 0 · follow_up_repeat 0.018 · latency p50 3.1 s · p95 4.4 s · cost $0.048 for 25 questions
 ```
 
 The eval is deterministic (substring and citation checks, no model grading), so prompt or model changes can be compared run to run, and it bypasses the answer cache so it always measures the model. Results are saved to `backend/evals/results/`.

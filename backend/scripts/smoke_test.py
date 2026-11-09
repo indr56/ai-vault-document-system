@@ -52,7 +52,8 @@ class Smoke:
         answer = response.json()["answer"]
         print(f"\n  Q: {question}\n  A: {answer['content']}")
         for c in answer["citations"]:
-            print(f"     [{c['number']}] {c['document_title']} p.{c['page_number']}")
+            page = f"p.{c['page_number']}" if c["page_number"] else "(no pages in this file type)"
+            print(f"     [{c['number']}] {c['document_title']} {page}")
         return answer
 
     # ------------------------------------------------------------------ scenario

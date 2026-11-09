@@ -370,7 +370,7 @@ Latest result (`chat-v7`, chat answers with low reasoning, all 25 cases passed):
 | `dangling_citation_marks` | `[n]` marks that lead to no source | 0 |
 | `wrong_amounts` | Dollar amounts a correct answer can't contain | 0 |
 | `follow_up_repeat` | Suggestions repeating a fact the answer gave | 1.8% |
-| `latency_p50_ms` / `latency_p95_ms` | Time to the full answer | 2.4 s / 3.1 s |
+| `latency_p50_ms` / `latency_p95_ms` | Time to the full answer | 3.1 s / 4.4 s (2.4 s / 3.1 s on an earlier run) |
 | `cost_usd_total` | The whole run, 25 questions | $0.048 |
 
 The off-topic question and the prompt-injection attempt were both stopped before reaching the model: retrieval found no relevant evidence, so the code answered "not found" itself (section 12).
