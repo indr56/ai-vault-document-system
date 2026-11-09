@@ -55,7 +55,7 @@ An AI agent writes code fast, so the controls were about making sure that code i
 6. **No regressions:** the full suite runs after every change, in the agent's sandbox and again on my machine.
 7. **Real stack, not only mocks:** each slice was run against Postgres, Redis, the worker and real OpenAI calls.
 8. **Gates before any change is accepted:**
-   - `make test`: 147 tests on a fake AI provider (no key needed, repeatable)
+   - `make test`: 149 tests on a fake AI provider (no key needed, repeatable)
    - `make lint`: ruff and mypy, plus the UI type-check and the database migration check
    - `make smoke`: the full user journey with the real models
    - `make eval`: 25 labelled questions with the real models, including a multi-turn chat
@@ -76,7 +76,7 @@ When a fix depends on how a model behaves, I measured the options on our real do
 | | 2) For versions of one document, code computes the word-level changes and adds them to the model's material | 5 of 5 runs correct; same speed; different documents unaffected | **Kept** (`comparison-v3`) |
 | A calculation answered wrongly after two earlier questions in the chat (found while checking the demo video: "$3,650 higher before the policy fee, or $3,900 including it") | 1) Rule 7 as it was (`chat-v6`), on the exact passages and conversation the app used | Wrong amount in 19 of 20 runs: the model stated results before its working | Rejected |
 | | 2) Rule 7 also says: write the working first and give each result once, at the end of its line (`chat-v7`) | 0 of 30 with one earlier conversation, but with the earlier answers of another real chat still 7 of 25 wrong and 6 of 25 unfinished ("$18,400 + $250 + $15,000?"). The model was answering with no reasoning step, and stopped on its own | Not enough alone |
-| | 3) Rule 7 as in 2), plus **low reasoning for chat answers**: the model thinks briefly before answering | 0 of 25 wrong, 0 of 25 unfinished; median 1.5 s; up to ~$0.0005 more per answer | **Kept**, with a multi-turn eval case. Insights, comparison, summaries and follow-ups are unchanged |
+| | 3) Rule 7 as in 2), plus **low reasoning for chat answers**: the model thinks briefly before answering | 0 of 25 wrong, 0 of 25 unfinished; median 1.5 s; up to ~$0.0005 more per answer. In the app, end to end: 10 of 10 demo chats fully correct (were 9 of 11 wrong) | **Kept**, with a multi-turn eval case. Insights, comparison, summaries and follow-ups are unchanged |
 | ~1,000-page documents timed out (80 map calls in sequence, 13+ minutes) | Sequential vs 8 calls at a time | 80 sections in under 2 minutes | **8 at a time**, results kept in page order |
 
 ### 4. What AI got wrong, and the guardrail each one left behind
@@ -197,7 +197,8 @@ Real figures from the Monitoring API (`/metrics/ai-usage`), averaged over the wa
 
 - **By model:** mini made 27 of the 63 calls and 98% of the cost ($0.131); nano 15 calls ($0.002); embeddings 21 calls ($0.00006).
 - **Caches:** 16 hits avoided 1,930 tokens; 25% of chat answers came from the cache.
-- **At scale:** about $0.004 per document processed and $0.0013 per question, so 1,000 documents and 10,000 questions cost roughly $17 before any cache hits.
+- **Low reasoning for chat answers** (section 3) adds 25–100 tokens per answer, up to ~$0.0005; the 25-question eval cost $0.048 with it ($0.037 for 24 questions before).
+- **At scale:** about $0.004 per document processed and about $0.002 per question, so 1,000 documents and 10,000 questions cost roughly $25 before any cache hits.
 
 ### 10. Prompt engineering rules (applied to every prompt)
 
@@ -358,7 +359,7 @@ Code has unit tests; prompts need the same, because a prompt change that fixes o
 | A "not found" answer whose [1][2] led nowhere | Case `abstain-broker-address` and metric `dangling_citation_marks` |
 | Follow-ups repeating the answer | Metric `follow_up_repeat` |
 
-Latest result (`chat-v7`, all 25 cases passed):
+Latest result (`chat-v7`, chat answers with low reasoning, all 25 cases passed):
 
 | Metric | What it measures | Result |
 |---|---|---|
@@ -368,8 +369,8 @@ Latest result (`chat-v7`, all 25 cases passed):
 | `dangling_citation_marks` | `[n]` marks that lead to no source | 0 |
 | `wrong_amounts` | Dollar amounts a correct answer can't contain | 0 |
 | `follow_up_repeat` | Suggestions repeating a fact the answer gave | 1.8% |
-| `latency_p50_ms` / `latency_p95_ms` | Time to the full answer | 3.1 s / 3.4 s |
-| `cost_usd_total` | The whole run, 25 questions | $0.043 |
+| `latency_p50_ms` / `latency_p95_ms` | Time to the full answer | 2.4 s / 3.1 s |
+| `cost_usd_total` | The whole run, 25 questions | $0.048 |
 
 The off-topic question and the prompt-injection attempt were both stopped before reaching the model: retrieval found no relevant evidence, so the code answered "not found" itself (section 12).
 
@@ -395,7 +396,7 @@ The off-topic question and the prompt-injection attempt were both stopped before
 | Vector database | pgvector (HNSW) combined with Postgres full-text search | 12 |
 | Streaming chat responses | Answers stream over SSE; follow-ups arrive with the end of the answer | 9 |
 | Real-time updates | Each processing stage and "insights ready / failed" are pushed over a WebSocket, so the UI updates live | README |
-| Comprehensive test coverage | 147 tests on a fake AI provider plus a 25-case eval on the real models | 2, 15 |
+| Comprehensive test coverage | 149 tests on a fake AI provider plus a 25-case eval on the real models | 2, 15 |
 | Cost tracking and optimisation | Every call metered by operation, model and prompt version; cache savings counted; four cost layers | 8, 9 |
 | Rate limiting and quota management | Per-user rate limits and a daily token quota across all of a user's keys | 12 |
 | Document version tracking | Versions feed cache keys, insights and comparisons; comparing versions uses the computed change list | 8, 14 |
