@@ -159,3 +159,37 @@ def test_chat_answers_use_reasoning_and_other_calls_keep_temperature_zero() -> N
     assert _sampling(0.0, "low") == {"reasoning_effort": "low"}
     assert _sampling(0.0, None) == {"temperature": 0.0}
     assert get_settings().chat_reasoning_effort == "low"
+
+
+class TestComputedValuesAreNotQuoted:
+    """The model wrote 'a total of "$18,650"' when the quote only says "$18,400 plus a $250 policy fee":
+    quotation marks claimed the source said it. Rule 7 forbids that; the code now enforces it."""
+
+    SOURCE = ["Annual premium: $18,400 plus a $250 policy fee. Notify us within 30 days of discovering a loss."]
+
+    def test_a_computed_total_loses_its_quotation_marks(self) -> None:
+        from app.services.chat import unquote_computed_values
+
+        answer = 'The quote is "$18,400 plus a $250 policy fee" [1], a total of "$18,650" [1].'
+        assert unquote_computed_values(answer, self.SOURCE) == (
+            'The quote is "$18,400 plus a $250 policy fee" [1], a total of $18,650 [1].'
+        )
+
+    def test_real_quotes_are_kept_whatever_the_formatting(self) -> None:
+        from app.services.chat import unquote_computed_values
+
+        for answer in [
+            'You must report "within 30 days of discovering a loss" [2].',
+            "You must report “within 30 days of discovering a loss” [2].",
+            'The premium is "**$18,400**" [1].',
+            'The premium is "$18,400." [1]',
+            'Total: "$18,400 plus a $250   policy fee [1]".',
+        ]:
+            assert unquote_computed_values(answer, self.SOURCE) == answer
+
+    def test_curly_quotes_and_text_without_numbers(self) -> None:
+        from app.services.chat import unquote_computed_values
+
+        assert unquote_computed_values("A total of “$18,650”.", self.SOURCE) == "A total of $18,650."
+        no_numbers = 'It is called "the policy" here, and "Section A" there.'
+        assert unquote_computed_values(no_numbers, self.SOURCE) == no_numbers

@@ -12,7 +12,7 @@ from sqlalchemy import select, update
 
 from app.db.session import sync_session
 from app.llm import get_provider
-from app.llm.base import StreamEvent
+from app.llm.base import Completion, StreamEvent
 from app.llm.prompts import followups as followups_prompt
 from app.llm.schemas import FollowUpQuestions, SectionNotes
 from app.models import AIUsage, Document
@@ -476,3 +476,45 @@ async def test_a_cached_answer_does_not_suggest_what_was_just_asked(
     again = (await client.post(url, json={"question": "What is the coinsurance?"})).json()["answer"]
     assert again["from_cache"] is True, (first["abstained"], first["content"][:80], again["content"][:80])
     assert asked not in again["follow_up_questions"]  # was: the cached answer offered it again
+
+
+async def test_a_computed_total_is_not_presented_as_a_quote(
+    client: httpx.AsyncClient, ready_docs: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seen on the real model: 'for a total of "$18,650"' (computed, not in the quote). Both the
+    regular and the streaming answer keep real quotes and drop the marks around the computed value."""
+    provider = get_provider()
+    real_complete = provider.acomplete
+    written = 'The GL quote costs "$18,400 plus a $250 policy fee" [1], for a total of "$18,650" [1].'
+    expected = 'The GL quote costs "$18,400 plus a $250 policy fee" [1], for a total of $18,650 [1].'
+
+    async def complete(messages, **kwargs):  # type: ignore[no-untyped-def]
+        completion = await real_complete(messages, **kwargs)
+        if "Sources:" in messages[-1]["content"]:
+            return Completion(text=written, usage=completion.usage)
+        return completion
+
+    streamed: list[bool] = []
+
+    async def stream(messages, **kwargs):  # type: ignore[no-untyped-def]
+        streamed.append(True)
+        completion = await real_complete(messages)
+        for part in (written[:40], written[40:]):
+            yield StreamEvent(delta=part)
+        yield StreamEvent(usage=completion.usage)
+
+    monkeypatch.setattr(provider, "acomplete", complete)
+    monkeypatch.setattr(provider, "astream", stream)
+    session_id = await _session(client, [ready_docs["quote"]])
+    answer = await _ask(client, session_id, "What is the annual premium and the policy fee?")
+    assert answer["content"] == expected
+
+    other_documents = await _session(client, [ready_docs["quote"], ready_docs["agreement"]])  # no cache hit
+    response = await client.post(
+        f"/chat/sessions/{other_documents}/messages/stream",
+        json={"question": "What is the annual premium and the policy fee?"},
+    )
+    assert response.status_code == 200
+    done = [line for line in response.text.splitlines() if line.startswith("data:") and '"answer"' in line][-1]
+    assert streamed  # answered by the model, not from the cache
+    assert json.loads(done[5:])["answer"]["content"] == expected

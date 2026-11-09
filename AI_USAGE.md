@@ -55,7 +55,7 @@ An AI agent writes code fast, so the controls were about making sure that code i
 6. **No regressions:** the full suite runs after every change, in the agent's sandbox and again on my machine.
 7. **Real stack, not only mocks:** each slice was run against Postgres, Redis, the worker and real OpenAI calls.
 8. **Gates before any change is accepted:**
-   - `make test`: 149 tests on a fake AI provider (no key needed, repeatable)
+   - `make test`: 153 tests on a fake AI provider (no key needed, repeatable)
    - `make lint`: ruff and mypy; the UI is type-checked in every Docker build
    - `make smoke`: the full user journey with the real models
    - `make eval`: 25 labelled questions with the real models, including a multi-turn chat
@@ -87,7 +87,7 @@ Each mistake was fixed, and also left something that stops the same kind of mist
 
 | # | What went wrong | How it was caught | Fix and lasting guardrail |
 |---|---|---|---|
-| 1 | **The model presented a computed number as a quote, with a contradictory explanation.** It said the GL quote is *"$3,650"* more (in quotation marks) *"before considering the $250 policy fee"*; but $3,650 already includes the fee | Reading real answers; the eval had no calculation question | Prompt rule 7 (`chat-v5`): show the working with cited inputs ("$18,400 + $250 − $15,000 = $3,650 [2][1]"), never quote computed values. **Arithmetic case added to the eval.** It came back in a longer chat (section 3). The fix that held: `chat-v7` asks for the working first and each result once, and **chat answers now use low reasoning**; the eval gained a **multi-turn case and a `wrong_amounts` metric**, which flags an answer that has the right total but also states a wrong one |
+| 1 | **The model presented a computed number as a quote, with a contradictory explanation.** It said the GL quote is *"$3,650"* more (in quotation marks) *"before considering the $250 policy fee"*; but $3,650 already includes the fee | Reading real answers; the eval had no calculation question | Prompt rule 7 (`chat-v5`): show the working with cited inputs ("$18,400 + $250 − $15,000 = $3,650 [2][1]"), never quote computed values. **Arithmetic case added to the eval.** It came back in a longer chat (section 3). The fix that held: `chat-v7` asks for the working first and each result once, and **chat answers now use low reasoning**; the eval gained a **multi-turn case and a `wrong_amounts` metric**, which flags an answer that has the right total but also states a wrong one. In the final check on a clean stack it put a correct computed total in quotation marks once more (*a total of "$18,650"*), so the rule is now enforced in code: **a quoted figure that is not in the sources loses its quotation marks**, tested on that exact answer |
 | 2 | **"Not found" answers cited every document**, which looked like evidence for an answer that doesn't exist | My UI testing | Not-found answers get no automatic citations (rule 4, `chat-v6`) |
 | 3 | **A "not found" answer that named what the documents do contain** ("the broker is Bayline Risk Partners [1][2], but no address is given") lost those citations, so [1][2] led nowhere | My walkthrough | Marks in such answers are mapped like any other. **New eval metric: `dangling_citation_marks`**, plus a "not found" eval case |
 | 4 | **Follow-up suggestions repeated the answer** (after the deductibles answer, all 3 asked for deductibles it had listed) and re-offered questions already asked | My walkthrough | The measured check in section 3. **New eval metric: `follow_up_repeat`** |
@@ -144,7 +144,7 @@ Each step is a separate, versioned prompt or plain code, so each can be tested, 
 
 - **Vendor-neutral:** models are set in `.env`; the vendor sits behind `llm/base.py::LLMProvider`. Another vendor is one new file.
 - **Structured outputs** (Pydantic models in `llm/schemas.py`) guarantee valid JSON for insights, comparison, follow-ups and the follow-up check.
-- **The right tool for each job:** some work is deliberately not given to a model. Citations are mapped by code, "not found" is a string check, and the change list between versions is computed by `difflib`.
+- **The right tool for each job:** some work is deliberately not given to a model. Citations are mapped by code, "not found" is a string check, quotation marks are checked against the sources, and the change list between versions is computed by `difflib`.
 - **Every call is metered** by operation, model and prompt version (`/metrics/ai-usage`).
 
 ### 8. Caching
@@ -272,6 +272,7 @@ A prompt alone is not a guarantee, so the important behaviours are also enforced
 - **No evidence, no model call.** If retrieval finds nothing relevant (similarity below 0.2 and no keyword match), the code abstains without calling the model: nothing to hallucinate from, and no cost.
 - **Hybrid retrieval.** Embeddings catch paraphrases ("pipe bursts" ≈ "discharge of plumbing systems"); full-text catches exact identifiers that embeddings blur ("CPP-4471-2026"). Reciprocal-rank fusion needs no score calibration between the two.
 - **Citations mapped by code**, unknown numbers ignored.
+- **Quotes checked against the sources.** A quoted span with a number that appears in no source (a computed total written as if quoted) keeps its text but loses its quotation marks, so a quotation mark always means the document says it.
 - **Prompt injection:** documents are untrusted data in every prompt, and an injection attempt is an eval case.
 - **Two-layer follow-up check** (model + embeddings): if one fails, the other still applies.
 - **Cache safety:** see section 8.
@@ -396,7 +397,7 @@ The off-topic question and the prompt-injection attempt were both stopped before
 | Vector database | pgvector (HNSW) combined with Postgres full-text search | 12 |
 | Streaming chat responses | Answers stream over SSE; follow-ups arrive with the end of the answer | 9 |
 | Real-time updates | Each processing stage and "insights ready / failed" are pushed over a WebSocket, so the UI updates live | README |
-| Comprehensive test coverage | 149 tests on a fake AI provider plus a 25-case eval on the real models | 2, 15 |
+| Comprehensive test coverage | 153 tests on a fake AI provider plus a 25-case eval on the real models | 2, 15 |
 | Cost tracking and optimisation | Every call metered by operation, model and prompt version; cache savings counted; four cost layers | 8, 9 |
 | Rate limiting and quota management | Per-user rate limits and a daily token quota across all of a user's keys | 12 |
 | Document version tracking | Versions feed cache keys, insights and comparisons; comparing versions uses the computed change list | 8, 14 |

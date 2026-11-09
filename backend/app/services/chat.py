@@ -258,6 +258,35 @@ async def prepare_question(
 
 
 # --------------------------------------------------------------------------- post-processing
+QUOTED_RE = re.compile(r"[\"“]([^\"“”\n]{1,200}?)[\"”]")
+
+
+def _normalise_for_match(text: str) -> str:
+    text = text.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    return " ".join(text.lower().split())
+
+
+def unquote_computed_values(answer: str, source_texts: list[str]) -> str:
+    """Remove quotation marks from quoted figures that are not in the sources.
+
+    Prompt rule 7 says never to put a computed value in quotation marks, but the model still
+    sometimes writes a total as if quoted ('a total of "$18,650"' when the quote only says
+    "$18,400 plus a $250 policy fee"). Quotation marks claim the source said it, so the code
+    enforces the rule: a quoted span with a number that does not appear in any source keeps its
+    text but loses the marks. Quotes without numbers are left as written."""
+    haystack = _normalise_for_match(" ".join(source_texts))
+
+    def check(match: re.Match[str]) -> str:
+        inner = match.group(1)
+        if not any(ch.isdigit() for ch in inner):
+            return match.group(0)
+        plain = CITATION_RE.sub("", inner).replace("*", "")  # bold and [n] marks are not source text
+        needle = _normalise_for_match(plain).strip().rstrip(".,;:")
+        return match.group(0) if needle and needle in haystack else inner
+
+    return QUOTED_RE.sub(check, answer)
+
+
 def extract_citations(answer: str, prepared: PreparedQuestion) -> list[dict[str, Any]]:
     """Map [n] markers in the answer back to the retrieved chunks (ignores invented numbers).
 
@@ -772,6 +801,7 @@ async def _ask(
                 attempt.answer_messages, reasoning_effort=get_settings().chat_reasoning_effort or None
             )
             answer, answer_usage = completion.text.strip(), completion.usage
+            answer = unquote_computed_values(answer, [s.content for s in prepared.sources])
             attempt.answer_usage = answer_usage
             prepared.usages.append(UsageEntry("chat_answer", completion.usage, chat_prompt.VERSION))
     except BaseException:
@@ -892,7 +922,7 @@ async def _generate(
                 yield "token", {"text": event.delta}
             if event.usage:
                 attempt.answer_usage = event.usage
-        answer = "".join(attempt.answer_parts).strip()
+        answer = unquote_computed_values("".join(attempt.answer_parts).strip(), [s.content for s in prepared.sources])
         if attempt.answer_usage:
             prepared.usages.append(UsageEntry("chat_answer", attempt.answer_usage, chat_prompt.VERSION))
 
