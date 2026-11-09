@@ -2,7 +2,7 @@
 
 Upload documents, get AI insights, and **chat with them in natural language, with every answer cited down to the document and page**. Think "ChatGPT for your documents", built as a production-style backend with a simple web UI. It runs as one command on a laptop and is designed for thousands of documents.
 
-**At a glance:** every required component and every bonus point in the brief is built and working · 146 automated tests · a 24-question RAG eval with real models scoring 100% on answers, citations (document and page) and abstention · uploads answer in 17 ms and documents are ready in about 4 s · about $0.004 to process a document and $0.0013 per answered question.
+**At a glance:** every required component and every bonus point in the brief is built and working · 147 automated tests · a 25-question RAG eval with real models scoring 100% on answers, citations (document and page) and abstention · uploads answer in 17 ms and documents are ready in about 4 s · about $0.004 to process a document and $0.0013 per answered question.
 
 **How I approached it:**
 
@@ -73,8 +73,8 @@ Or run the whole scenario automatically:
 
 ```bash
 make smoke   # end-to-end: upload → process → insights → versioning → chat → streaming → summary → compare → metrics
-make test    # 146 tests in Docker with a fake AI provider (no API key or cost)
-make eval    # RAG quality evaluation (24 questions) against the running stack
+make test    # 147 tests in Docker with a fake AI provider (no API key or cost)
+make eval    # RAG quality evaluation (25 questions) against the running stack
 make help    # all commands
 ```
 
@@ -111,7 +111,7 @@ make dev-ui       # terminal 3 (optional): UI dev server on :5173 with hot reloa
 | Data storage (metadata and status, insights, conversations, messages with citations, processing metrics, performance data) | `documents`, `document_insights` + `document_summaries`, `chat_sessions`, `chat_messages` (citations + retrieval trace), `processing_runs` + `processing_stage_runs`, `request_metrics` + `ai_usage` (§5) |
 | Demo | The five-minute tour above, and the demo video |
 
-**Every bonus point:** multi-document chat · intelligent follow-up suggestions · summary customisation (length, focus, tone) · automated categorisation and tagging · sentiment and key-insight extraction · comparative analysis · a simple web UI · real-time updates over WebSocket · smart caching (embeddings and answers in Redis) · pgvector · streaming chat over SSE · 146 tests · cost tracking and optimisation · rate limiting and quotas · document version tracking · batch processing optimisations · structured logging and observability · health checks and monitoring endpoints. Where each lives:
+**Every bonus point:** multi-document chat · intelligent follow-up suggestions · summary customisation (length, focus, tone) · automated categorisation and tagging · sentiment and key-insight extraction · comparative analysis · a simple web UI · real-time updates over WebSocket · smart caching (embeddings and answers in Redis) · pgvector · streaming chat over SSE · 147 tests · cost tracking and optimisation · rate limiting and quotas · document version tracking · batch processing optimisations · structured logging and observability · health checks and monitoring endpoints. Where each lives:
 
 | Area | Feature | Where |
 |---|---|---|
@@ -457,10 +457,10 @@ The growth path beyond that (roughly 100k+ documents or many concurrent users), 
 
 | Command | What | Cost |
 |---|---|---|
-| `make test` | 146 tests:<br/>• Units: parsing (incl. edge-case files), validation, chunking, RRF fusion, citation mapping, cost, the cache guard, the version change list<br/>• API integration on real Postgres + Redis: upload, duplicates, validation, failures, batch, versioning, download, summaries, reprocess, chat with citations, abstention, multi-turn, caches, SSE, follow-up checks, comparison, metrics, rate limits, body limits, job recovery, documented error responses | Free (fake AI) |
+| `make test` | 147 tests:<br/>• Units: parsing (incl. edge-case files), validation, chunking, RRF fusion, citation mapping, cost, the cache guard, the version change list<br/>• API integration on real Postgres + Redis: upload, duplicates, validation, failures, batch, versioning, download, summaries, reprocess, chat with citations, abstention, multi-turn, caches, SSE, follow-up checks, comparison, metrics, rate limits, body limits, job recovery, documented error responses | Free (fake AI) |
 | `make lint` | ruff + mypy, all passing | — |
 | `make smoke` | The full user journey against the real stack and model, with readable output | ≈ $0.03 |
-| `make eval` | 24 labelled questions over the samples:<br/>• answer accuracy<br/>• citation document and page accuracy<br/>• abstention accuracy (incl. off-topic and prompt injection)<br/>• multi-document questions and arithmetic over cited figures<br/>• false-abstention rate<br/>• citation marks that lead nowhere<br/>• follow-ups that repeat the answer<br/>• latency and cost | ≈ $0.04 |
+| `make eval` | 25 labelled questions over the samples:<br/>• answer accuracy<br/>• citation document and page accuracy<br/>• abstention accuracy (incl. off-topic and prompt injection)<br/>• multi-document questions and arithmetic over cited figures, including after earlier questions in the same chat<br/>• wrong amounts stated next to correct working<br/>• false-abstention rate<br/>• citation marks that lead nowhere<br/>• follow-ups that repeat the answer<br/>• latency and cost | ≈ $0.04 |
 
 Every bug fix comes with a test that was first run against the old code and failed there.
 

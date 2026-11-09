@@ -10,6 +10,8 @@ Metrics (deterministic, so runs are comparable across prompt/model changes):
 - follow_up_repeat  share of follow-up suggestions that restate the answer (contain one of the
                     case's expected facts, e.g. "24 hours" after an answer about 24 hours) - lower is better
 - false_abstention  answerable questions the system refused
+- wrong_amounts     dollar amounts in an answer that a correct answer can't contain (cases with
+                    `amounts`), e.g. a miscomputed total stated next to correct working
 - latency p50/p95 and cost per answer (from the metrics API)
 Results are written to evals/results/<timestamp>.json.
 """
@@ -64,6 +66,9 @@ def score(case: dict[str, Any], answer: dict[str, Any], ids: dict[str, str]) -> 
         result["follow_up_repeats"] = sum(any(f in q for f in facts) for q in follow_ups)
         result["follow_ups"] = len(follow_ups)
     result["false_abstention"] = answer["abstained"]
+    if "amounts" in case:
+        stated = re.findall(r"\$([0-9]{1,3}(?:,[0-9]{3})*)", answer["content"])
+        result["wrong_amounts"] = sum(a not in case["amounts"] for a in stated)
     source = case.get("source")
     if source:
         cited = answer["citations"]
@@ -93,8 +98,12 @@ def main() -> None:
 
     results = []
     for case in dataset["cases"]:
-        # A fresh session per question (no history) and no answer cache, so every run measures the model.
+        # A fresh session per case and no answer cache, so every run measures the model.
         session = client.post("/chat/sessions", json={"document_ids": list(ids.values())}).json()
+        for earlier in case.get("before", []):  # multi-turn cases: earlier questions in the same chat
+            client.post(
+                f"/chat/sessions/{session['id']}/messages", json={"question": earlier, "use_cache": False}
+            ).raise_for_status()
         response = client.post(
             f"/chat/sessions/{session['id']}/messages", json={"question": case["question"], "use_cache": False}
         )
@@ -114,6 +123,7 @@ def main() -> None:
         "abstention_acc": rate(results, "abstention_correct"),
         "false_abstention": rate(results, "false_abstention"),
         "dangling_citation_marks": sum(r["dangling_marks"] for r in results),
+        "wrong_amounts": sum(r.get("wrong_amounts", 0) for r in results),
         "follow_up_repeat": (
             round(sum(r.get("follow_up_repeats", 0) for r in results) / total_follow_ups, 3)
             if (total_follow_ups := sum(r.get("follow_ups", 0) for r in results))

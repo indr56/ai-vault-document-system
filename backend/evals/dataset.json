@@ -1,5 +1,5 @@
 {
-  "description": "RAG quality checks over the sample documents. `expect` = substrings the answer must contain (any one of each inner list); `source` = the document (and page) a correct answer should cite; `abstain` = the documents do not contain the answer.",
+  "description": "RAG quality checks over the sample documents. `expect` = substrings the answer must contain (any one of each inner list); `source` = the document (and page) a correct answer should cite; `abstain` = the documents do not contain the answer. `before` = questions asked first in the same chat (multi-turn cases); `amounts` = the only dollar amounts a correct answer may contain (`wrong_amounts` counts any other).",
   "documents": {
     "policy_2026": "acme_property_policy_2026_renewal.pdf",
     "quote": "northwind_general_liability_quote.docx",
@@ -212,6 +212,38 @@
         [
           "3,400"
         ]
+      ],
+      "source": {
+        "doc": "quote"
+      },
+      "amounts": [
+        "18,400",
+        "250",
+        "15,000",
+        "3,400",
+        "18,650",
+        "3,650"
+      ]
+    },
+    {
+      "id": "multi-turn-arithmetic",
+      "before": [
+        "What is the flood deductible, and how long do we have to report a loss?",
+        "And for earthquake?"
+      ],
+      "question": "What does the GL quote cost compared with the broker's cyber fee?",
+      "expect": [
+        [
+          "3,650"
+        ]
+      ],
+      "amounts": [
+        "18,400",
+        "250",
+        "15,000",
+        "3,400",
+        "18,650",
+        "3,650"
       ],
       "source": {
         "doc": "quote"
