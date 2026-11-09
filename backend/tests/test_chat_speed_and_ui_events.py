@@ -12,6 +12,7 @@ from sqlalchemy import select, update
 
 from app.db.session import sync_session
 from app.llm import get_provider
+from app.llm.base import StreamEvent
 from app.llm.prompts import followups as followups_prompt
 from app.llm.schemas import FollowUpQuestions, SectionNotes
 from app.models import AIUsage, Document
@@ -67,6 +68,41 @@ async def test_standalone_follow_up_skips_the_rewrite_call(
     assert "rewrite_query" not in _operations(session_id)
     await _ask(client, session_id, "And what about windstorm?")
     assert _operations(session_id).count("rewrite_query") == 1
+
+
+# ------------------------------------------------------------------ chat answers think briefly first (chat-v7)
+async def test_only_chat_answers_ask_for_reasoning(
+    client: httpx.AsyncClient, ready_docs: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = get_provider()
+    real_complete = provider.acomplete
+    calls: list[tuple[str, str | None]] = []
+
+    async def complete(messages, **kwargs):  # type: ignore[no-untyped-def]
+        kind = "answer" if "Sources:" in messages[-1]["content"] else "other"
+        calls.append((kind, kwargs.get("reasoning_effort")))
+        return await real_complete(messages, **kwargs)
+
+    async def stream(messages, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(("stream", kwargs.get("reasoning_effort")))
+        completion = await real_complete(messages)  # the fake streams via its own acomplete; bypass the spy
+        yield StreamEvent(delta=completion.text)
+        yield StreamEvent(usage=completion.usage)
+
+    monkeypatch.setattr(provider, "acomplete", complete)
+    monkeypatch.setattr(provider, "astream", stream)
+    session_id = await _session(client, [ready_docs["policy"]])
+    await _ask(client, session_id, "What is the earthquake deductible?")
+    await _ask(client, session_id, "And for flood?")  # needs a rewrite: a non-answer call
+    response = await client.post(
+        f"/chat/sessions/{session_id}/messages/stream", json={"question": "What is the coinsurance?"}
+    )
+    assert response.status_code == 200
+
+    assert ("answer", "low") in calls and ("stream", "low") in calls
+    assert ("other", None) in calls  # the rewrite keeps temperature 0, no reasoning
+    assert all(effort == "low" for kind, effort in calls if kind in ("answer", "stream"))
+    assert all(effort is None for kind, effort in calls if kind == "other")
 
 
 # ------------------------------------------------------------------ follow-ups: parallel and smaller (#6, #4)

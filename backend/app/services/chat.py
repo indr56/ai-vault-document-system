@@ -768,7 +768,9 @@ async def _ask(
             attempt.answer_messages = chat_prompt.build_messages(
                 question, prepared.standalone_question, prepared.sources, prepared.history
             )
-            completion = await provider.acomplete(attempt.answer_messages)  # failure: see _save_interrupted
+            completion = await provider.acomplete(  # failure: see _save_interrupted
+                attempt.answer_messages, reasoning_effort=get_settings().chat_reasoning_effort or None
+            )
             answer, answer_usage = completion.text.strip(), completion.usage
             attempt.answer_usage = answer_usage
             prepared.usages.append(UsageEntry("chat_answer", completion.usage, chat_prompt.VERSION))
@@ -882,7 +884,9 @@ async def _generate(
         attempt.answer_messages = chat_prompt.build_messages(
             question, prepared.standalone_question, prepared.sources, prepared.history
         )
-        async for event in provider.astream(attempt.answer_messages):
+        async for event in provider.astream(
+            attempt.answer_messages, reasoning_effort=get_settings().chat_reasoning_effort or None
+        ):
             if event.delta:
                 attempt.answer_parts.append(event.delta)
                 yield "token", {"text": event.delta}

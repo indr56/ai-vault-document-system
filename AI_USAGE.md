@@ -75,7 +75,8 @@ When a fix depends on how a model behaves, I measured the options on our real do
 | Comparing a policy with its renewal missed the added cyber exclusion in 4 of 5 runs | 1) Instruct the model to list changes item by item | Fixed versions, but broke comparisons of different documents (30 rows, then a reply cut off) | Rejected: it fixed one case by breaking another |
 | | 2) For versions of one document, code computes the word-level changes and adds them to the model's material | 5 of 5 runs correct; same speed; different documents unaffected | **Kept** (`comparison-v3`) |
 | A calculation answered wrongly after two earlier questions in the chat (found while checking the demo video: "$3,650 higher before the policy fee, or $3,900 including it") | 1) Rule 7 as it was (`chat-v6`), on the exact passages and conversation the app used | Wrong amount in 19 of 20 runs: the model stated results before its working | Rejected |
-| | 2) Rule 7 also says: write the working first and give each result once, at the end of its line | 0 of 30 runs wrong | **Kept** (`chat-v7`), with a multi-turn eval case |
+| | 2) Rule 7 also says: write the working first and give each result once, at the end of its line (`chat-v7`) | 0 of 30 with one earlier conversation, but with the earlier answers of another real chat still 7 of 25 wrong and 6 of 25 unfinished ("$18,400 + $250 + $15,000?"). The model was answering with no reasoning step, and stopped on its own | Not enough alone |
+| | 3) Rule 7 as in 2), plus **low reasoning for chat answers**: the model thinks briefly before answering | 0 of 25 wrong, 0 of 25 unfinished; median 1.5 s; up to ~$0.0005 more per answer | **Kept**, with a multi-turn eval case. Insights, comparison, summaries and follow-ups are unchanged |
 | ~1,000-page documents timed out (80 map calls in sequence, 13+ minutes) | Sequential vs 8 calls at a time | 80 sections in under 2 minutes | **8 at a time**, results kept in page order |
 
 ### 4. What AI got wrong, and the guardrail each one left behind
@@ -86,7 +87,7 @@ Each mistake was fixed, and also left something that stops the same kind of mist
 
 | # | What went wrong | How it was caught | Fix and lasting guardrail |
 |---|---|---|---|
-| 1 | **The model presented a computed number as a quote, with a contradictory explanation.** It said the GL quote is *"$3,650"* more (in quotation marks) *"before considering the $250 policy fee"*; but $3,650 already includes the fee | Reading real answers; the eval had no calculation question | Prompt rule 7 (`chat-v5`): show the working with cited inputs ("$18,400 + $250 − $15,000 = $3,650 [2][1]"), never quote computed values. **Arithmetic case added to the eval.** It came back in a longer chat (section 3): `chat-v7` asks for the working first and each result once, and the eval gained a **multi-turn case and a `wrong_amounts` metric**, which flags an answer that has the right total but also states a wrong one |
+| 1 | **The model presented a computed number as a quote, with a contradictory explanation.** It said the GL quote is *"$3,650"* more (in quotation marks) *"before considering the $250 policy fee"*; but $3,650 already includes the fee | Reading real answers; the eval had no calculation question | Prompt rule 7 (`chat-v5`): show the working with cited inputs ("$18,400 + $250 − $15,000 = $3,650 [2][1]"), never quote computed values. **Arithmetic case added to the eval.** It came back in a longer chat (section 3). The fix that held: `chat-v7` asks for the working first and each result once, and **chat answers now use low reasoning**; the eval gained a **multi-turn case and a `wrong_amounts` metric**, which flags an answer that has the right total but also states a wrong one |
 | 2 | **"Not found" answers cited every document**, which looked like evidence for an answer that doesn't exist | My UI testing | Not-found answers get no automatic citations (rule 4, `chat-v6`) |
 | 3 | **A "not found" answer that named what the documents do contain** ("the broker is Bayline Risk Partners [1][2], but no address is given") lost those citations, so [1][2] led nowhere | My walkthrough | Marks in such answers are mapped like any other. **New eval metric: `dangling_citation_marks`**, plus a "not found" eval case |
 | 4 | **Follow-up suggestions repeated the answer** (after the deductibles answer, all 3 asked for deductibles it had listed) and re-offered questions already asked | My walkthrough | The measured check in section 3. **New eval metric: `follow_up_repeat`** |
@@ -137,7 +138,7 @@ Each step is a separate, versioned prompt or plain code, so each can be tested, 
 
 | Task | Model | Why |
 |---|---|---|
-| Chat answers, insights, comparison, custom summaries | `gpt-5.4-mini` | Current-generation, strong at following instructions and structured outputs, supports `temperature=0` (repeatable answers), $0.75 / $4.50 per 1M tokens |
+| Chat answers, insights, comparison, custom summaries | `gpt-5.4-mini` | Current-generation, strong at following instructions and structured outputs, $0.75 / $4.50 per 1M tokens. Runs at `temperature=0` (repeatable output), except **chat answers, which use low reasoning**: measured, it is what makes multi-step arithmetic reliable a few turns into a chat (section 3). With reasoning on, the model only allows the default temperature |
 | Query rewriting, follow-ups, the follow-up check, long-document section notes | `gpt-5.4-nano` | Short, focused jobs; about 4× cheaper and fast. For the follow-up check, measured against mini (section 3) |
 | Embeddings | `text-embedding-3-small` (1536-d) | Good retrieval quality at $0.02 per 1M tokens |
 
@@ -205,7 +206,7 @@ Real figures from the Monitoring API (`/metrics/ai-usage`), averaged over the wa
 3. **Exact values as written** (amounts, dates), because paraphrased numbers are where errors hide.
 4. **Untrusted content is data**: document text is wrapped and every prompt says to ignore instructions inside it.
 5. **Machine-checkable outcomes**: a fixed abstention sentence, `[n]` citations, Pydantic schemas.
-6. **Temperature 0** for repeatable output.
+6. **Temperature 0** for repeatable output, except chat answers, which think briefly first (low reasoning, measured in section 3).
 7. **Measure a change on the real failure, and check nothing else got worse** (the rejected Compare fix in section 3).
 8. **Let code compute what the model keeps missing**, rather than adding more instructions.
 
@@ -259,7 +260,7 @@ My thinking behind it:
 - **Numbered sources, with title and page in the label.** The model only writes `[2]`; code maps it to the exact chunk, document and page. Citations are **deterministic and verifiable**, and an invented `[9]` is ignored, so it can't become a fake citation.
 - **An exact abstention sentence (rule 4).** "Not found" becomes a string check, not a judgement. That makes the `abstained` flag, the abstention metric, "never cache not-found answers" and the eval's abstention accuracy possible. The second half ("say what the sources do contain") keeps the reply useful, and any source it marks still links (section 4, #3).
 - **Partial answers (rule 5) and conflicts (rule 6).** Broker questions often span documents ("the GL premium and the broker's cyber fee") or versions. Answering what is supported and naming the gap beats all-or-nothing; surfacing conflicts matters when v1 and v2 disagree.
-- **Show the working (rule 7).** Added after a real failure (section 4, #1). The reader can check any arithmetic. Its last sentence came from a second failure: a few turns into a chat, the model wrote its conclusions first and then the working, and the conclusions were wrong. Asking for the working first fixed it (19 of 20 wrong → 0 of 30).
+- **Show the working (rule 7).** Added after a real failure (section 4, #1). The reader can check any arithmetic. Its last sentence came from a second failure: a few turns into a chat, the model wrote its conclusions first and then the working, and the conclusions were wrong (19 of 20 runs). Asking for the working first helped but wasn't enough on its own; together with low reasoning for chat answers it was 0 of 25 wrong and 0 of 25 unfinished. A prompt guides; where the model itself was the limit, the setting had to change.
 - **Exact figures (rule 3).** In insurance, `$50,000 per occurrence` vs `$50,000 aggregate` is a material difference.
 - **History for the answer, the rewritten question for the search.** A raw follow-up like "and for earthquake?" retrieves nothing useful. The interpretation is shown to the model and to the user, so a misreading is visible.
 
@@ -357,7 +358,7 @@ Code has unit tests; prompts need the same, because a prompt change that fixes o
 | A "not found" answer whose [1][2] led nowhere | Case `abstain-broker-address` and metric `dangling_citation_marks` |
 | Follow-ups repeating the answer | Metric `follow_up_repeat` |
 
-Latest result (all 24 cases passed):
+Latest result (`chat-v7`, all 25 cases passed):
 
 | Metric | What it measures | Result |
 |---|---|---|
@@ -365,9 +366,10 @@ Latest result (all 24 cases passed):
 | `citation_doc_acc` / `citation_page_acc` | The right document / page is cited | 100% / 100% |
 | `abstention_acc` / `false_abstention` | Unanswerable questions abstain; answerable ones don't | 100% / 0% |
 | `dangling_citation_marks` | `[n]` marks that lead to no source | 0 |
+| `wrong_amounts` | Dollar amounts a correct answer can't contain | 0 |
 | `follow_up_repeat` | Suggestions repeating a fact the answer gave | 1.8% |
-| `latency_p50_ms` / `latency_p95_ms` | Time to the full answer | 2.9 s / 4.2 s |
-| `cost_usd_total` | The whole run, 24 questions | $0.037 |
+| `latency_p50_ms` / `latency_p95_ms` | Time to the full answer | 3.1 s / 3.4 s |
+| `cost_usd_total` | The whole run, 25 questions | $0.043 |
 
 The off-topic question and the prompt-injection attempt were both stopped before reaching the model: retrieval found no relevant evidence, so the code answered "not found" itself (section 12).
 

@@ -114,6 +114,7 @@ class FakeProvider:
         model: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 1200,
+        reasoning_effort: str | None = None,
     ) -> Completion:
         last = messages[-1]["content"]
         if "Latest question:" in last:  # query rewriting
@@ -131,6 +132,7 @@ class FakeProvider:
         model: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 1200,
+        reasoning_effort: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         completion = await self.acomplete(messages)
         for word in completion.text.split(" "):

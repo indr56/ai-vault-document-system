@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
     llm_timeout_seconds: float = 60.0
+    # Chat answers think briefly before answering. Without it, a few turns into a chat the model often
+    # stated a computed total wrongly or stopped mid-calculation (7 of 25 runs wrong, 6 unfinished);
+    # with "low": 0 of 25 for both, ~1.5 s. Empty = no reasoning, temperature 0. Other calls are unchanged.
+    chat_reasoning_effort: str = "low"
 
     # --- Document processing ---
     max_upload_mb: int = 25

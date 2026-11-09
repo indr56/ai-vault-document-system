@@ -148,3 +148,14 @@ def test_chat_prompt_asks_for_the_working_before_each_result() -> None:
     assert "give each computed result only once, at the end of its working line" in words
     assert "never put a computed value in quotation marks" in words
     assert chat_prompt.VERSION == "chat-v7"
+
+
+def test_chat_answers_use_reasoning_and_other_calls_keep_temperature_zero() -> None:
+    """Reasoning goes only where it was measured to help (chat answers); with it, the model only accepts
+    the default temperature, so temperature must be left out of that request."""
+    from app.core.config import get_settings
+    from app.llm.openai_provider import _sampling
+
+    assert _sampling(0.0, "low") == {"reasoning_effort": "low"}
+    assert _sampling(0.0, None) == {"temperature": 0.0}
+    assert get_settings().chat_reasoning_effort == "low"

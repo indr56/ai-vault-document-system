@@ -83,6 +83,7 @@ class LLMProvider(Protocol):
         model: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 1200,
+        reasoning_effort: str | None = None,
     ) -> Completion: ...
 
     async def acomplete_structured(
@@ -102,4 +103,5 @@ class LLMProvider(Protocol):
         model: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 1200,
+        reasoning_effort: str | None = None,
     ) -> AsyncIterator[StreamEvent]: ...

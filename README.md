@@ -307,6 +307,7 @@ question ──► (follow-up?) rewrite to standalone question   [fast model, us
          ──► drop weak evidence (cosine < 0.2 unless it matched keywords)
                └─ nothing left → abstain without calling the model (no hallucination, no cost)
          ──► answer with numbered sources [1]..[n] (title + page), history for tone
+               (gpt-5.4-mini with low reasoning, so multi-step arithmetic stays right)
          ──► map [n] → chunk → {document, page, snippet}; ignore invented numbers
          ──► grounded = has valid citations; abstained = starts with the fixed "not found" sentence
          ∥   follow-up candidates, generated in parallel with the answer (fast model; answerable from the same sources)
@@ -337,7 +338,7 @@ Where the brief offered a choice ("X or Y"), one option was chosen deliberately:
 | Database | **Local PostgreSQL 16 + pgvector** (not Supabase) | Reviewers run it offline with one command; vectors live next to the data (one transaction, joins, per-owner filters). Trade-off: a dedicated vector DB scales further; see §8 |
 | Task queue | **Celery + Redis** (not RQ) | Retries with backoff, acks-late (no lost jobs if a worker dies), routing to separate queues, beat scheduler. Heavier than RQ, but production-proven |
 | File parsing | **pdfplumber** (not PyPDF2) + python-docx | Better text layout and **table extraction**, which matters for insurance declarations pages |
-| LLM | **OpenAI** behind a provider interface | `gpt-5.4-mini` (answers, insights, comparison, summaries), `gpt-5.4-nano` (rewrite, follow-ups, the follow-up check, long-document notes), `text-embedding-3-small`. Swapping to Claude is one new class (`llm/base.py`). See AI_USAGE.md for model choice and cost |
+| LLM | **OpenAI** behind a provider interface | `gpt-5.4-mini` (answers, insights, comparison, summaries; chat answers with low reasoning, measured to keep arithmetic right a few turns into a chat), `gpt-5.4-nano` (rewrite, follow-ups, the follow-up check, long-document notes), `text-embedding-3-small`. Swapping to Claude is one new class (`llm/base.py`). See AI_USAGE.md for model choice and cost |
 | Framework for RAG | **LangChain text splitter only**; retrieval and prompts in plain code | The splitter is solid and saves time; the retrieval logic and prompts are the product, so they stay explicit, testable and easy to change in an interview |
 | Embeddings | **OpenAI text-embedding-3-small** (not sentence-transformers) | Strong quality at $0.02/1M tokens; no 1–2 GB model in the image, and fast cold starts. Trade-off: network dependency (mitigated by caching) |
 | Storage | **Local volume behind a `Storage` interface** | Zero setup; S3 is a drop-in class with the same three methods |
@@ -464,11 +465,11 @@ The growth path beyond that (roughly 100k+ documents or many concurrent users), 
 
 Every bug fix comes with a test that was first run against the old code and failed there.
 
-Latest eval run (gpt-5.4-mini, all 24 cases passed):
+Latest eval run (gpt-5.4-mini, chat-v7, all 25 cases passed):
 
 ```
 answer_accuracy 1.0 · citation_doc_acc 1.0 · citation_page_acc 1.0 · abstention_acc 1.0 · false_abstention 0.0
-dangling_citation_marks 0 · follow_up_repeat 0.018 · latency p50 2.9 s · p95 4.2 s · cost $0.037 for 24 questions
+dangling_citation_marks 0 · wrong_amounts 0 · follow_up_repeat 0.018 · latency p50 3.1 s · p95 3.4 s · cost $0.043 for 25 questions
 ```
 
 The eval is deterministic (substring and citation checks, no model grading), so prompt or model changes can be compared run to run, and it bypasses the answer cache so it always measures the model. Results are saved to `backend/evals/results/`.

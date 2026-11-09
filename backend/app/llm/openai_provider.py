@@ -32,6 +32,11 @@ def to_service_error(exc: Exception) -> AIServiceError:
     return AIServiceError("The AI provider could not process the request.", code="ai_request_failed")
 
 
+def _sampling(temperature: float, reasoning_effort: str | None) -> dict[str, object]:
+    """With reasoning on, the model only accepts the default temperature, so it is left out."""
+    return {"reasoning_effort": reasoning_effort} if reasoning_effort else {"temperature": temperature}
+
+
 def _ms_since(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
 
@@ -134,14 +139,15 @@ class OpenAIProvider:
         model: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 1200,
+        reasoning_effort: str | None = None,
     ) -> Completion:
         start = time.perf_counter()
         try:
-            response = await self._aclient.chat.completions.create(
+            response = await self._aclient.chat.completions.create(  # type: ignore[call-overload]
                 model=model or self.chat_model,
                 messages=messages,  # type: ignore[arg-type]
-                temperature=temperature,
                 max_completion_tokens=max_tokens,
+                **_sampling(temperature, reasoning_effort),
             )
         except openai.OpenAIError as exc:
             raise to_service_error(exc) from exc
@@ -154,6 +160,7 @@ class OpenAIProvider:
         model: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 1200,
+        reasoning_effort: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         start = time.perf_counter()
         used_model = model or self.chat_model
@@ -161,9 +168,9 @@ class OpenAIProvider:
             stream = await self._aclient.chat.completions.create(  # type: ignore[call-overload]
                 model=used_model,
                 messages=messages,  # type: ignore[arg-type]
-                temperature=temperature,
                 max_completion_tokens=max_tokens,
                 stream=True,
+                **_sampling(temperature, reasoning_effort),
                 stream_options={"include_usage": True},
             )
             async for chunk in stream:
