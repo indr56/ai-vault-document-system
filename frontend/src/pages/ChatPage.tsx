@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Empty, ErrorNote } from "../components/ui";
 import { api, listAll, post, postStream, timeAgo } from "../lib/api";
+import { answerPieces } from "../lib/format";
 import type { ChatSession, Citation, DocumentItem, Message, VaultEvent } from "../lib/types";
 
 interface Props {
@@ -290,7 +291,12 @@ function Conversation({
             <div className="msg assistant">
               <div className="bubble">
                 {pending.answer ? (
-                  <span className="prose cursor">{pending.answer}</span>
+                  <span className="prose cursor">
+                    {answerPieces(pending.answer).map((piece, i) => {
+                      const text = piece.kind === "cite" ? piece.mark : piece.text;
+                      return piece.bold ? <strong key={i}>{text}</strong> : <Fragment key={i}>{text}</Fragment>;
+                    })}
+                  </span>
                 ) : (
                   <span className="row muted">
                     <span className="spinner" /> {pending.stage}
@@ -358,15 +364,16 @@ function UserMsg({ text }: { text: string }) {
 function AssistantMsg({ m }: { m: Message }) {
   const [active, setActive] = useState<number | null>(null);
   const byNumber = new Map(m.citations.map((c) => [c.number, c]));
-  const parts = m.content.split(/(\[\d{1,2}\])/g);
   return (
     <div className="msg assistant">
       <div className={`bubble ${m.abstained ? "abstained" : ""}`}>
         <div className="prose">
-          {parts.map((part, i) => {
-            const match = part.match(/^\[(\d{1,2})\]$/);
-            const citation = match ? byNumber.get(Number(match[1])) : undefined;
-            if (!citation) return <Fragment key={i}>{renderBold(part)}</Fragment>;
+          {answerPieces(m.content).map((piece, i) => {
+            const citation = piece.kind === "cite" ? byNumber.get(piece.number) : undefined;
+            if (!citation) {
+              const text = piece.kind === "cite" ? piece.mark : piece.text;
+              return piece.bold ? <strong key={i}>{text}</strong> : <Fragment key={i}>{text}</Fragment>;
+            }
             return (
               <button
                 key={i}
@@ -419,12 +426,5 @@ function SourceCard({ c, active, onClick }: { c: Citation; active: boolean; onCl
       </div>
       {active && <div className="muted" style={{ marginTop: 4 }}>{c.snippet}</div>}
     </div>
-  );
-}
-
-/** Minimal inline formatting: the model sometimes uses **bold** for key figures. */
-function renderBold(text: string) {
-  return text.split(/(\*\*[^*]+\*\*)/g).map((piece, i) =>
-    piece.startsWith("**") && piece.endsWith("**") ? <strong key={i}>{piece.slice(2, -2)}</strong> : piece,
   );
 }
