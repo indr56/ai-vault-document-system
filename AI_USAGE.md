@@ -56,7 +56,7 @@ An AI agent writes code fast, so the controls were about making sure that code i
 7. **Real stack, not only mocks:** each slice was run against Postgres, Redis, the worker and real OpenAI calls.
 8. **Gates before any change is accepted:**
    - `make test`: 149 tests on a fake AI provider (no key needed, repeatable)
-   - `make lint`: ruff and mypy, plus the UI type-check and the database migration check
+   - `make lint`: ruff and mypy; the UI is type-checked in every Docker build
    - `make smoke`: the full user journey with the real models
    - `make eval`: 25 labelled questions with the real models, including a multi-turn chat
    - a click-through of every page in Chrome, and a run from a clean Docker build

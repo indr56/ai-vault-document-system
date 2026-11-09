@@ -33,3 +33,7 @@ backend/static/
 
 # Celery beat local state (make dev-worker)
 celerybeat-schedule*
+
+# Build and local caches
+*.tsbuildinfo
+dump.rdb

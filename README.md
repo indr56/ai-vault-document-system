@@ -17,6 +17,8 @@ Upload documents, get AI insights, and **chat with them in natural language, wit
 make up            # → UI on http://localhost:9700 · API docs on http://localhost:9700/docs · API key: vault-demo-key
 ```
 
+**Demo video (3 min):** [docs/demo.mp4](docs/demo.mp4): uploads and failures, insights, a new version, multi-turn chat with citations, comparison and monitoring, on the live app with real AI calls.
+
 ![Chat with citations](docs/screenshots/chat.png)
 
 More screenshots: [documents and insights](docs/screenshots/documents.png) · [comparison](docs/screenshots/compare.png) · [monitoring](docs/screenshots/monitoring.png)
@@ -109,7 +111,7 @@ make dev-ui       # terminal 3 (optional): UI dev server on :5173 with hot reloa
 | Start chat session · Ask question · Chat history · Multi-turn context | `POST /chat/sessions` (one or many documents) · `POST /messages` and `/messages/stream` · `GET /chat/sessions/{id}` · follow-ups rewritten into standalone questions using the last 6 turns |
 | Document statistics API · Processing metrics API | `GET /metrics/documents` (counts, success rate, p50/p95, per-stage timings, errors, queue wait), plus `/metrics/ai-usage`, `/metrics/api`, `/metrics/system` |
 | Data storage (metadata and status, insights, conversations, messages with citations, processing metrics, performance data) | `documents`, `document_insights` + `document_summaries`, `chat_sessions`, `chat_messages` (citations + retrieval trace), `processing_runs` + `processing_stage_runs`, `request_metrics` + `ai_usage` (§5) |
-| Demo | The five-minute tour above, and the demo video |
+| Demo | [The demo video](docs/demo.mp4) and the five-minute tour above |
 
 **Every bonus point:** multi-document chat · intelligent follow-up suggestions · summary customisation (length, focus, tone) · automated categorisation and tagging · sentiment and key-insight extraction · comparative analysis · a simple web UI · real-time updates over WebSocket · smart caching (embeddings and answers in Redis) · pgvector · streaming chat over SSE · 149 tests · cost tracking and optimisation · rate limiting and quotas · document version tracking · batch processing optimisations · structured logging and observability · health checks and monitoring endpoints. Where each lives:
 
@@ -461,7 +463,7 @@ The growth path beyond that (roughly 100k+ documents or many concurrent users), 
 | `make test` | 149 tests:<br/>• Units: parsing (incl. edge-case files), validation, chunking, RRF fusion, citation mapping, cost, the cache guard, the version change list<br/>• API integration on real Postgres + Redis: upload, duplicates, validation, failures, batch, versioning, download, summaries, reprocess, chat with citations, abstention, multi-turn, caches, SSE, follow-up checks, comparison, metrics, rate limits, body limits, job recovery, documented error responses | Free (fake AI) |
 | `make lint` | ruff + mypy, all passing | — |
 | `make smoke` | The full user journey against the real stack and model, with readable output | ≈ $0.03 |
-| `make eval` | 25 labelled questions over the samples:<br/>• answer accuracy<br/>• citation document and page accuracy<br/>• abstention accuracy (incl. off-topic and prompt injection)<br/>• multi-document questions and arithmetic over cited figures, including after earlier questions in the same chat<br/>• wrong amounts stated next to correct working<br/>• false-abstention rate<br/>• citation marks that lead nowhere<br/>• follow-ups that repeat the answer<br/>• latency and cost | ≈ $0.04 |
+| `make eval` | 25 labelled questions over the samples:<br/>• answer accuracy<br/>• citation document and page accuracy<br/>• abstention accuracy (incl. off-topic and prompt injection)<br/>• multi-document questions and arithmetic over cited figures, including after earlier questions in the same chat<br/>• wrong amounts stated next to correct working<br/>• false-abstention rate<br/>• citation marks that lead nowhere<br/>• follow-ups that repeat the answer<br/>• latency and cost | ≈ $0.05 |
 
 Every bug fix comes with a test that was first run against the old code and failed there.
 
@@ -493,7 +495,7 @@ backend/
   scripts/          entrypoint, sample generator, smoke test         evals/  RAG evaluation
 frontend/           React + Vite + TypeScript UI (built into the API image, served at /)
 samples/            sample documents (+ edge cases)
-docs/               screenshots
+docs/               screenshots and the demo video
 ```
 
 The rules are kept simple so changes are quick and safe (details in [AGENTS.md](AGENTS.md)):
