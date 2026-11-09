@@ -1,6 +1,17 @@
 # AI Vault Document System
 
-Upload documents, get AI insights, and **chat with them in natural language, with every answer cited down to the document and page**. Think "ChatGPT for your documents", built as a production-style backend. It runs as one command on a laptop and is designed to scale to thousands of documents.
+Upload documents, get AI insights, and **chat with them in natural language, with every answer cited down to the document and page**. Think "ChatGPT for your documents", built as a production-style backend with a simple web UI. It runs as one command on a laptop and is designed for thousands of documents.
+
+**At a glance:** every required component and every bonus point in the brief is built and working · 146 automated tests · a 24-question RAG eval with real models scoring 100% on answers, citations (document and page) and abstention · uploads answer in 17 ms and documents are ready in about 4 s · about $0.004 to process a document and $0.0013 per answered question.
+
+**How I approached it:**
+
+- **Built for a real user.** The samples are an insurance broker's vault: a property policy and its renewal, a liability quote, a broker agreement, a claims procedure. Every feature answers a question that user has: *what does it say, where exactly, what changed at renewal, how does this quote compare?*
+- **Answers you can trust over answers that sound good.** Every claim is cited to a document and page; when the documents don't say, the system says so instead of guessing; numbers are quoted exactly and calculations show their working.
+- **The API never waits on AI.** Uploads return `202` at once; parsing, embedding, analysis and comparisons run in background workers, with live status over WebSocket.
+- **Failure paths are designed, not discovered.** Bad files, lost jobs, killed workers, provider outages, oversized uploads and Redis being down each have a defined, tested behaviour.
+- **Measured, not assumed.** A labelled eval scores every prompt or model change; every AI call is metered by operation, model and prompt version; cache savings are counted.
+- **Simple to run, simple to change.** One command to start; strict layering; one file per prompt; a provider interface; [AGENTS.md](AGENTS.md) for the next engineer or AI agent.
 
 ```
 make up            # → UI on http://localhost:9700 · API docs on http://localhost:9700/docs · API key: vault-demo-key
@@ -15,7 +26,7 @@ More screenshots: [documents and insights](docs/screenshots/documents.png) · [c
 ## Contents
 
 1. [Quick start](#1-quick-start)
-2. [What's included (feature checklist)](#2-whats-included)
+2. [What's included (mapped to the brief)](#2-whats-included)
 3. [Architecture and flow](#3-architecture-and-flow)
 4. [API overview (with curl)](#4-api-overview)
 5. [Data model](#5-data-model)
@@ -25,7 +36,7 @@ More screenshots: [documents and insights](docs/screenshots/documents.png) · [c
 9. [Reliability, errors and observability](#9-reliability-errors-and-observability)
 10. [Testing and evaluation](#10-testing-and-evaluation)
 11. [Project structure](#11-project-structure)
-12. [Limitations and next steps](#12-limitations-and-next-steps)
+12. [Documentation map](#12-documentation-map)
 
 ---
 
@@ -49,12 +60,21 @@ make up                    # builds and starts db, redis, api (+UI) and worker; 
 
 There's no `make`? Use `cp .env.example .env` then `docker compose up --build -d`.
 
-**Try it:** open the UI, drop in the files from [`samples/`](samples/), wait a few seconds for "Ready", then chat. Or run the whole scenario automatically:
+**Try it:** open the UI, drop in the files from [`samples/`](samples/), wait a few seconds for "Ready", then chat. A good five-minute tour:
+
+1. Upload the 2025 policy, the quote, the broker agreement and the claims procedure, plus `edge-cases/corrupt.pdf` and `edge-cases/scanned_no_text.pdf`: the good ones turn **Ready**, then **Insights**; the bad ones fail with a clear reason.
+2. Open the property policy: summary, key facts with pages, tags, a custom summary (try *executive*, focus *flood*).
+3. Upload `acme_property_policy_2026_renewal.pdf` with **Upload new version** on the 2025 policy.
+4. Chat with the policy, the quote and the agreement: *"What is the flood deductible, and how long do we have to report a loss?"*, then *"And for earthquake?"*, then *"Who is the CEO?"* (it says it can't find it).
+5. Compare v2 with v1, focus *what changed at renewal*.
+6. Open Monitoring: processing times, AI cost by operation, cache savings, API latency.
+
+Or run the whole scenario automatically:
 
 ```bash
 make smoke   # end-to-end: upload → process → insights → versioning → chat → streaming → summary → compare → metrics
-make test    # 38 tests in Docker with a fake AI provider (no API key or cost)
-make eval    # RAG quality evaluation (19 questions) against the running stack
+make test    # 146 tests in Docker with a fake AI provider (no API key or cost)
+make eval    # RAG quality evaluation (24 questions) against the running stack
 make help    # all commands
 ```
 
@@ -78,7 +98,20 @@ make dev-ui       # terminal 3 (optional): UI dev server on :5173 with hot reloa
 
 ## 2. What's included
 
-All required components plus every bonus item. Each one works end to end and is covered by tests, the smoke test or the eval.
+**Every requirement in the brief:**
+
+| Brief | How it is built |
+|---|---|
+| Intelligent upload handler | Type, size and empty checks, content sniffing (a renamed `.exe` is rejected), duplicate detection by SHA-256, versions, batch upload with per-file errors, a size limit enforced before the body is read |
+| Smart document analysis | One structured AI call per document: summary, type, category, tags, key points, key facts with pages, entities, sentiment, suggested questions; map-reduce for long documents |
+| Asynchronous processing pipeline | Celery + Redis: parse → chunk → embed → analyse, with retries, time limits, per-document locks, live status and a sweep that recovers lost or stuck jobs |
+| Upload & ingestion · Document retrieval · AI insights | `POST /documents` (+ `/batch`) · `GET /documents`, `/{id}`, `/status`, `/file`, `/versions` · `GET /{id}/insights`, `POST /{id}/summaries` |
+| Start chat session · Ask question · Chat history · Multi-turn context | `POST /chat/sessions` (one or many documents) · `POST /messages` and `/messages/stream` · `GET /chat/sessions/{id}` · follow-ups rewritten into standalone questions using the last 6 turns |
+| Document statistics API · Processing metrics API | `GET /metrics/documents` (counts, success rate, p50/p95, per-stage timings, errors, queue wait), plus `/metrics/ai-usage`, `/metrics/api`, `/metrics/system` |
+| Data storage (metadata and status, insights, conversations, messages with citations, processing metrics, performance data) | `documents`, `document_insights` + `document_summaries`, `chat_sessions`, `chat_messages` (citations + retrieval trace), `processing_runs` + `processing_stage_runs`, `request_metrics` + `ai_usage` (§5) |
+| Demo | The five-minute tour above, and the demo video |
+
+**Every bonus point:** multi-document chat · intelligent follow-up suggestions · summary customisation (length, focus, tone) · automated categorisation and tagging · sentiment and key-insight extraction · comparative analysis · a simple web UI · real-time updates over WebSocket · smart caching (embeddings and answers in Redis) · pgvector · streaming chat over SSE · 146 tests · cost tracking and optimisation · rate limiting and quotas · document version tracking · batch processing optimisations · structured logging and observability · health checks and monitoring endpoints. Where each lives:
 
 | Area | Feature | Where |
 |---|---|---|
@@ -86,26 +119,29 @@ All required components plus every bonus item. Each one works end to end and is 
 | | Async pipeline: parse → chunk → embed → analyse (Celery), returns `202` immediately | `services/processing.py` |
 | | PDF (with tables and page numbers), DOCX (with tables), TXT, Markdown | `services/parsing.py` |
 | | Clear failures: scanned/image-only PDF, corrupt, password-protected, empty, bad encoding | `services/parsing.py` |
-| | Retries with backoff for transient AI errors; idempotent (per-document lock) | `workers/tasks.py` |
+| | Retries with backoff for transient AI errors; idempotent (per-document lock); time limits; a sweep that recovers lost or stuck jobs | `workers/tasks.py` |
 | **AI insights** | Summary, document type, category, tags, key points, **key facts with page numbers**, entities, sentiment, suggested questions | `services/insights.py` |
-| | Long documents: map-reduce (section notes → final analysis) | `services/insights.py` |
+| | Long documents: map-reduce (section notes, 8 in parallel → final analysis); notes saved for later summaries | `services/insights.py` |
 | | **Customisable summaries** (length × tone × focus), stored and reused | `POST /documents/{id}/summaries` |
 | **Chat** | Sessions over **one or many documents**; history; **multi-turn** (follow-ups rewritten into standalone questions) | `services/chat.py` |
 | | **Hybrid retrieval** (pgvector + Postgres full-text, RRF fusion) | `services/retrieval.py` |
 | | **Citations** `[n]` mapped to document, page and snippet; **abstains** when the answer isn't in the documents | `llm/prompts/chat.py` |
-| | **Streaming** answers (SSE) and **follow-up suggestions** | `/messages/stream` |
-| **Advanced AI** | **Document comparison** (2–5 docs, e.g. policy v1 vs v2): structured differences with values, pages and impact | `services/comparison.py` |
+| | **Streaming** answers (SSE) and **follow-up suggestions**, generated in parallel with the answer and checked so they don't repeat it or the chat | `/messages/stream` |
+| | Delete a conversation; a chat whose documents were all deleted says so | `DELETE /chat/sessions/{id}` |
+| **Advanced AI** | **Document comparison** (2–5 docs, e.g. policy v1 vs v2): structured differences with values, pages and impact. For versions of one document, the code computes the word-level changes and gives them to the model, so nothing changed is missed | `services/comparison.py` |
 | **Product** | **Versioning** (upload a new version; history; open any older version; delete promotes the previous one) | `POST /documents` + `replaces_document_id` |
+| | **Download the original file** | `GET /documents/{id}/file` |
 | | **Duplicate detection** (same content returns the existing document, so nobody pays twice) | `services/documents.py` |
 | | **Batch upload** with per-file errors | `POST /documents/batch` |
 | | **Real-time status** over WebSocket (Redis pub/sub) | `/api/v1/events` |
-| | Simple **web UI** (React + TypeScript): documents, insights, chat with clickable citations, compare, monitoring | `frontend/` |
+| | Simple **web UI** (React + TypeScript): documents (drag-and-drop or file picker), insights, chat with clickable citations, compare, monitoring | `frontend/` |
 | **Production** | **Cost tracking**: every model call stored with tokens, latency, USD | `services/usage.py` |
-| | **Rate limiting** per API key + **daily token quota** | `core/rate_limit.py` |
-| | **Caching**: embeddings (Redis); answers (Redis, invalidated by document version), matched **by meaning**, so paraphrased questions reuse an answer; summaries (DB) | `services/cache.py` |
+| | **Rate limiting** and a **daily token quota** per user, across all of that user's API keys | `core/rate_limit.py` |
+| | **Body-size limits** checked before authentication or parsing (`413` before an oversized upload is read) | `core/body_limit.py` |
+| | **Caching**: embeddings (Redis); answers (Redis, keyed by document and prompt versions), also matched **by meaning** so paraphrases reuse an answer, but only when numbers and names match; insights and summaries (DB) | `services/cache.py` |
 | | **Metrics APIs**: documents, processing (p50/p95, per stage, errors), AI usage and cost, chat quality, API latency per route, system health and queue depth | `services/metrics.py` |
 | | Health and readiness probes; structured JSON logs with request IDs | `api/health.py`, `main.py` |
-| | API-key auth with per-owner data isolation | `core/security.py` |
+| | API-key auth (hashed keys, create / list / revoke) with per-owner data isolation | `core/security.py`, `/api-keys` |
 
 ---
 
@@ -150,14 +186,14 @@ flowchart LR
 ## 4. API overview
 
 Full interactive docs: **http://localhost:9700/docs**. All endpoints are under `/api/v1` and need `X-API-Key`.
-Errors always look like `{"error": {"code", "message", "details", "request_id"}}`.
+Errors always look like `{"error": {"code", "message", "details", "request_id"}}`, including framework errors (unknown route, wrong method, unreadable body). Every endpoint lists its error responses in `/docs`.
 
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/documents` | Upload (multipart `file`, optional `title`, `replaces_document_id`) → 202 |
 | POST | `/documents/batch` | Upload many (`files`), per-file results and errors |
 | GET | `/documents` | List; filters `status`, `category`, `tag`, `q`, `include_old_versions`; paging |
-| GET | `/documents/{id}` · `/status` | Details · lightweight status for polling |
+| GET | `/documents/{id}` · `/status` · `/file` | Details · lightweight status for polling · the original file |
 | GET | `/documents/{id}/insights` | AI summary, category, tags, key facts (with pages), entities, sentiment |
 | POST | `/documents/{id}/summaries` | Custom summary `{length, tone, focus}` |
 | GET | `/documents/{id}/versions` · `/processing-runs` | Version history · per-attempt stage timings |
@@ -165,11 +201,15 @@ Errors always look like `{"error": {"code", "message", "details", "request_id"}}
 | DELETE | `/documents/{id}` | Delete a version |
 | POST | `/chat/sessions` | Start a chat over `document_ids` (1–20) |
 | GET | `/chat/sessions` · `/chat/sessions/{id}` | List · full history with citations |
+| DELETE | `/chat/sessions/{id}` | Delete a conversation |
 | POST | `/chat/sessions/{id}/messages` | Ask; returns answer, citations, follow-ups, grounded/abstained flags |
 | POST | `/chat/sessions/{id}/messages/stream` | Same, streamed as SSE: `status` → `token`… → `done` |
-| POST / GET | `/comparisons` · `/comparisons/{id}` | Compare 2–5 documents (background job) |
+| POST / GET | `/comparisons` · `/comparisons/{id}` | Compare 2–5 documents (background job) · list · result |
+| DELETE | `/comparisons/{id}` | Delete a comparison (`409` while it is running) |
 | GET | `/metrics/documents` · `/ai-usage` · `/api` · `/system` | Monitoring |
-| WS | `/events?api_key=…` | Live document / comparison events |
+| WS | `/events` | Live document, comparison and chat events. Header `X-API-Key`, or for browsers a single-use `?ticket=` from `POST /events/ticket`, so the key never appears in a URL |
+| POST / GET / DELETE | `/api-keys` | Create (shown once) · list · revoke API keys |
+| GET | `/config` | Upload rules (allowed types, size and batch limits), so clients never hard-code them |
 | GET | `/health` · `/health/ready` | Liveness · readiness (DB, Redis, worker heartbeat, AI key) |
 
 **Copy-paste walkthrough**
@@ -209,7 +249,7 @@ Example answer (trimmed):
 ```json
 {
   "content": "The flood deductible is \"$50,000 per occurrence\" [1].",
-  "citations": [{"number": 1, "document_title": "acme property policy 2026 renewal", "page_number": 1,
+  "citations": [{"number": 1, "document_title": "acme property policy 2025", "page_number": 1,
                  "snippet": "… Flood deductible: $50,000 per occurrence …", "similarity": 0.45}],
   "follow_up_questions": ["What is the earthquake deductible?", "…"],
   "grounded": true, "abstained": false, "standalone_question": "What is the flood deductible?",
@@ -258,7 +298,8 @@ Schema is managed by **Alembic** (`backend/alembic/versions/`), applied automati
 question ──► (follow-up?) rewrite to standalone question   [fast model, uses last 6 turns]
          ──► answer cache, exact?  (owner + document versions + question + prompt version)
          ──► embed question (Redis-cached)
-         ──► answer cache, by meaning?  (cosine ≥ 0.88 with an answered question on the same documents)
+         ──► answer cache, by meaning?  (cosine ≥ 0.88 with an answered question on the same documents,
+                                         and the same numbers and names)
          ──► hybrid search over the session's ready documents only
                • vector: pgvector cosine (HNSW), top 24
                • keyword: Postgres websearch_to_tsquery + ts_rank_cd, top 24
@@ -268,8 +309,9 @@ question ──► (follow-up?) rewrite to standalone question   [fast model, us
          ──► answer with numbered sources [1]..[n] (title + page), history for tone
          ──► map [n] → chunk → {document, page, snippet}; ignore invented numbers
          ──► grounded = has valid citations; abstained = starts with the fixed "not found" sentence
-         ──► follow-up suggestions (fast model; answerable from the same sources)
-         ──► store message + retrieval trace + usage; cache the answer
+         ∥   follow-up candidates, generated in parallel with the answer (fast model; answerable from the same sources)
+         ──► check candidates against this answer and the chat's earlier answers (fast model + embeddings, in parallel)
+         ──► store message + retrieval trace + usage; cache the answer (never a "not found")
 ```
 
 Why each step exists:
@@ -279,8 +321,9 @@ Why each step exists:
 - **Fixed abstention sentence**: makes "not in the documents" machine-detectable, so it's measurable (`abstention_rate`) and never cached.
 - **Numbered sources with page labels**: citations are deterministic. The model cites `[2]` and the code knows exactly which chunk and page that is.
 - **Prompt-injection defence**: document text is wrapped and declared as untrusted data. The eval includes an injection case.
+- **Checked follow-ups**: generating them from the sources (not the answer) lets them run in parallel with the answer; a second check then drops any the answer or the chat already covered. The design was chosen by measuring three options (see AI_USAGE.md §3).
 
-The full prompt and its reasoning are in [AI_USAGE.md](AI_USAGE.md#the-chat-prompt).
+The full prompt and its reasoning are in [AI_USAGE.md](AI_USAGE.md#11-the-chat-prompt).
 
 ---
 
@@ -294,11 +337,23 @@ Where the brief offered a choice ("X or Y"), one option was chosen deliberately:
 | Database | **Local PostgreSQL 16 + pgvector** (not Supabase) | Reviewers run it offline with one command; vectors live next to the data (one transaction, joins, per-owner filters). Trade-off: a dedicated vector DB scales further; see §8 |
 | Task queue | **Celery + Redis** (not RQ) | Retries with backoff, acks-late (no lost jobs if a worker dies), routing to separate queues, beat scheduler. Heavier than RQ, but production-proven |
 | File parsing | **pdfplumber** (not PyPDF2) + python-docx | Better text layout and **table extraction**, which matters for insurance declarations pages |
-| LLM | **OpenAI** behind a provider interface | `gpt-5.4-mini` (answers, insights, comparison), `gpt-5.4-nano` (rewrite, follow-ups), `text-embedding-3-small`. Swapping to Claude is one new class (`llm/base.py`). See AI_USAGE.md for model choice and cost |
+| LLM | **OpenAI** behind a provider interface | `gpt-5.4-mini` (answers, insights, comparison, summaries), `gpt-5.4-nano` (rewrite, follow-ups, the follow-up check, long-document notes), `text-embedding-3-small`. Swapping to Claude is one new class (`llm/base.py`). See AI_USAGE.md for model choice and cost |
 | Framework for RAG | **LangChain text splitter only**; retrieval and prompts in plain code | The splitter is solid and saves time; the retrieval logic and prompts are the product, so they stay explicit, testable and easy to change in an interview |
 | Embeddings | **OpenAI text-embedding-3-small** (not sentence-transformers) | Strong quality at $0.02/1M tokens; no 1–2 GB model in the image, and fast cold starts. Trade-off: network dependency (mitigated by caching) |
 | Storage | **Local volume behind a `Storage` interface** | Zero setup; S3 is a drop-in class with the same three methods |
 | Streaming | **SSE for chat, WebSocket for status** | SSE fits one-way token streams over plain HTTP (works with POST, proxies, curl). WebSocket fits long-lived, multi-event status updates |
+
+**How scope was prioritised**
+
+The brief says document chat is the key feature and prefers a fully working subset to partial features. Effort was weighted accordingly:
+
+1. **Document chat done properly:** hybrid retrieval, page-level citations, honest "not found", multi-turn, streaming, then an eval to prove it.
+2. **A pipeline that never loses or corrupts work:** clear failure codes, retries, locks, recovery of lost jobs.
+3. **Bonus features chosen for the user's real workflow:** versions and comparison (renewals are a broker's daily work), multi-document chat (policy vs quote vs agreement), summaries for different readers.
+4. **Production concerns that change behaviour, not just dashboards:** quotas and rate limits, cost per operation, caches that are safe to reuse.
+5. **A thin UI** over the same public APIs, so everything shown is also available to any API client.
+
+Each feature was built as a vertical slice, end to end with tests, against the real stack.
 
 **Other decisions**
 
@@ -306,13 +361,15 @@ Where the brief offered a choice ("X or Y"), one option was chosen deliberately:
 - **Version = new row.** Old versions stay queryable and comparable; `is_latest` keeps lists clean. The answer cache keys on document versions, so a new version never serves stale answers.
 - **Duplicates return the existing document** (200 instead of 202) rather than an error: the user's intent is satisfied, and nobody pays to process the same bytes twice.
 - **Deterministic fake provider for tests**, using feature-hashed embeddings, so retrieval behaves meaningfully. Tests are free, offline and stable.
+- **Code computes, the model explains.** Citations, "not found" and the changes between versions are computed by code; the model is used where language understanding is needed.
+- **Limits are per user, not per key**, so creating more keys never means more quota.
 - **API keys hashed (SHA-256)**; a demo key is seeded on startup so reviewers can start immediately.
 
 **Assumptions**
 
-- Documents are text-based. Scanned PDFs are detected and fail with a clear message (OCR is a next step).
+- Documents are text-based. Scanned (image-only) PDFs are detected and fail with a clear message (`no_extractable_text`), so nobody is left with a document that silently answers nothing.
 - English full-text configuration (the embeddings themselves are multilingual).
-- A single tenant per API key; sharing between users is out of scope.
+- Each user's data is private to that user (across all of their API keys); sharing documents between users is out of scope.
 - Max 25 MB per file (configurable).
 
 ---
@@ -331,12 +388,12 @@ What's already in place:
   - Answer cache.
   - Duplicate detection.
   - Cheaper "nano" model for auxiliary calls.
-  - Map-reduce for long documents.
-  - Daily token quota per key.
+  - Map-reduce for long documents, 8 sections in parallel, with the notes saved so later summaries cost one call.
+  - Daily token quota per user.
 - **Batched embeddings** (96 chunks per request) and bulk inserts.
 - **Safety nets:** a periodic task re-queues documents stuck in `queued`, and a per-document lock prevents double processing.
 
-Next steps at larger scale (roughly 100k+ documents or many concurrent users):
+The growth path beyond that (roughly 100k+ documents or many concurrent users), with each change behind an existing interface:
 
 | Pressure | Change |
 |---|---|
@@ -344,7 +401,6 @@ Next steps at larger scale (roughly 100k+ documents or many concurrent users):
 | Vector search | Partition `document_chunks` by owner; or move vectors to a dedicated store (pgvector → Qdrant/pgvecto.rs) behind the existing retrieval function |
 | Worker throughput | Autoscale workers on queue depth (already exposed in `/metrics/system`); OpenAI Batch API for bulk insights at half price |
 | Metrics tables | Time-partitioning / retention for `request_metrics` and `ai_usage`, or ship them to Prometheus/OTel |
-| Large files | Stream to disk instead of reading the whole upload into memory |
 | Beat | Run Celery beat as its own single service when there are several worker replicas |
 
 ---
@@ -358,6 +414,29 @@ Next steps at larger scale (roughly 100k+ documents or many concurrent users):
 - Transient AI errors (timeouts, rate limits, 5xx) are retried (SDK retries, then job retries at 10s/30s/90s). Only the final failure marks the document `failed`, and `POST /reprocess` retries it.
 - Provider errors are never leaked: chat returns `503 ai_service_unavailable` / `ai_request_failed` in the standard error envelope.
 - Workers ack late, so a crashed worker's job is redelivered rather than lost.
+- A periodic sweep re-sends lost jobs (without duplicating ones still waiting in a long queue), fails insights left pending by a killed worker so "Retry insights" appears, and closes runs left open.
+- Reprocessing is refused (`409 already_processing`) while a job holds the document, and a manual reprocess resets the attempt count.
+- Oversized requests are refused with `413` before authentication or parsing, so a huge upload is never written to disk.
+
+**Performance** (measured on a laptop through `/metrics`, real models)
+
+| What | p50 | p95 |
+|---|---|---|
+| Upload accepted (`POST /documents`, returns 202) | 17 ms | 98 ms |
+| Document ready (parse, chunk, embed, analyse) | 4.1 s | 6.3 s |
+| Chat answer, full (non-streaming) | 2.9 s | 6.6 s |
+| Chat answer, streaming: response starts | 15 ms | 31 ms |
+| Comparison accepted (`POST /comparisons`, runs in the background) | 21 ms | 42 ms |
+| Document list | 8 ms | 26 ms |
+
+**Security**
+
+- API keys are stored hashed (SHA-256), created and revoked through `/api-keys`; the full key is shown only once.
+- Every query is filtered by owner, so one user can never read another's documents, chats or metrics.
+- The WebSocket uses a single-use, 60-second ticket, so the API key never appears in a URL or a log.
+- Uploads are checked by content, not just extension, and oversized bodies are refused before they are read.
+- Document text is treated as untrusted data in every prompt (prompt-injection defence, tested in the eval).
+- Logs carry request ids and metadata, not API keys or document contents; provider errors are never passed through to clients.
 
 **Observability**
 
@@ -366,7 +445,7 @@ Next steps at larger scale (roughly 100k+ documents or many concurrent users):
   - processing success rate and p50/p95
   - per-stage timings and error codes
   - queue wait
-  - AI tokens and cost by operation and model
+  - AI tokens and cost by operation and model, and the cost saved by caches
   - chat latency, grounded / abstention / cache-hit rates
   - API p50/p95 and error rates per route
   - DB, Redis, worker heartbeat and queue depth
@@ -378,19 +457,21 @@ Next steps at larger scale (roughly 100k+ documents or many concurrent users):
 
 | Command | What | Cost |
 |---|---|---|
-| `make test` | 38 tests:<br/>• Units: parsing (incl. edge-case files), validation, chunking, RRF fusion, citation mapping, cost<br/>• API integration on real Postgres + Redis: upload, duplicates, validation, failures, batch, versioning, summaries, reprocess, chat with citations, abstention, multi-turn, cache, SSE, comparison, metrics, rate limits | Free (fake AI) |
-| `make lint` | ruff + mypy (strict-ish), all passing | — |
+| `make test` | 146 tests:<br/>• Units: parsing (incl. edge-case files), validation, chunking, RRF fusion, citation mapping, cost, the cache guard, the version change list<br/>• API integration on real Postgres + Redis: upload, duplicates, validation, failures, batch, versioning, download, summaries, reprocess, chat with citations, abstention, multi-turn, caches, SSE, follow-up checks, comparison, metrics, rate limits, body limits, job recovery, documented error responses | Free (fake AI) |
+| `make lint` | ruff + mypy, all passing | — |
 | `make smoke` | The full user journey against the real stack and model, with readable output | ≈ $0.03 |
-| `make eval` | 19 labelled questions over the samples:<br/>• answer accuracy<br/>• citation document and page accuracy<br/>• abstention accuracy (incl. off-topic and prompt injection)<br/>• arithmetic over cited figures<br/>• false-abstention rate<br/>• latency and cost | ≈ $0.03 |
+| `make eval` | 24 labelled questions over the samples:<br/>• answer accuracy<br/>• citation document and page accuracy<br/>• abstention accuracy (incl. off-topic and prompt injection)<br/>• multi-document questions and arithmetic over cited figures<br/>• false-abstention rate<br/>• citation marks that lead nowhere<br/>• follow-ups that repeat the answer<br/>• latency and cost | ≈ $0.04 |
 
-Latest eval run (gpt-5.4-mini):
+Every bug fix comes with a test that was first run against the old code and failed there.
+
+Latest eval run (gpt-5.4-mini, all 24 cases passed):
 
 ```
 answer_accuracy 1.0 · citation_doc_acc 1.0 · citation_page_acc 1.0 · abstention_acc 1.0 · false_abstention 0.0
-latency p50 2.2 s · p95 3.3 s · cost $0.025 for 19 questions
+dangling_citation_marks 0 · follow_up_repeat 0.018 · latency p50 2.9 s · p95 4.2 s · cost $0.037 for 24 questions
 ```
 
-The eval is deterministic (substring and citation checks), so prompt or model changes can be compared run to run. Results are saved to `backend/evals/results/`.
+The eval is deterministic (substring and citation checks, no model grading), so prompt or model changes can be compared run to run, and it bypasses the answer cache so it always measures the model. Results are saved to `backend/evals/results/`.
 
 ---
 
@@ -423,16 +504,14 @@ The rules are kept simple so changes are quick and safe (details in [AGENTS.md](
 
 ---
 
-## 12. Limitations and next steps
+## 12. Documentation map
 
-- **OCR** for scanned PDFs (e.g. Tesseract or a vision model) is detected but not yet performed.
-- **Auth** is API-key only. Production would use SSO/OAuth with organisations and roles.
-- **Citations are chunk-level** (page + snippet). Next: sentence-level highlighting in a PDF viewer.
-- **Re-ranking:** a cross-encoder or LLM re-ranker on the top ~20 chunks would help on very large vaults.
-- **Evaluation:** add LLM-as-judge faithfulness scoring, and run the eval in CI on prompt changes.
-- **Chat latency** (~2.5 s): follow-up suggestions run after the answer. They could run in parallel or be streamed after the `done` event.
-- **Conversation memory** is the last 6 turns. Long chats could summarise older turns.
-- **Comparison** uses summaries + key facts + top chunks per document. For very long contracts, a clause-by-clause alignment would be more thorough.
+| Document | What it covers |
+|---|---|
+| This README | Setup, features, architecture, API, data model, RAG design, decisions, scale, reliability, testing |
+| [AI_USAGE.md](AI_USAGE.md) | How AI tools were used to build the system and how their output was verified; models, caching and cost; every prompt and the thinking behind it; the evaluation |
+| [AGENTS.md](AGENTS.md) | Commands, layering rules and where each kind of change goes, for engineers and AI coding agents |
+| http://localhost:9700/docs | Interactive API reference, with every request, response and error |
 
 ---
 
